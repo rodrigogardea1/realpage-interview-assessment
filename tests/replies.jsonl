@@ -1,0 +1,33 @@
+{"text": "1", "intent": "book_thu"}
+{"text": "1 please", "intent": "book_thu"}
+{"text": "Thursday works for me", "intent": "book_thu"}
+{"text": "thu", "intent": "book_thu"}
+{"text": "Let's do Thurs afternoon", "intent": "book_thu"}
+{"text": "Is Thursday still available?", "intent": "book_thu"}
+{"text": "el jueves por favor", "intent": "book_thu"}
+{"text": "2", "intent": "book_fri"}
+{"text": "Friday please", "intent": "book_fri"}
+{"text": "is Fri ok", "intent": "book_fri"}
+{"text": "Option 2", "intent": "book_fri"}
+{"text": "fri works better", "intent": "book_fri"}
+{"text": "viernes", "intent": "book_fri"}
+{"text": "STOP", "intent": "stop"}
+{"text": "stop", "intent": "stop"}
+{"text": "Please stop texting me", "intent": "stop"}
+{"text": "unsubscribe", "intent": "stop"}
+{"text": "Take me off your list", "intent": "stop"}
+{"text": "Don't contact me again", "intent": "stop"}
+{"text": "No me escriban más", "intent": "stop"}
+{"text": "opt out", "intent": "stop"}
+{"text": "stop by tomorrow?", "intent": "question"}
+{"text": "Thu or Fri?", "intent": "question"}
+{"text": "How much is a 2 bedroom?", "intent": "question"}
+{"text": "¿tienen parking?", "intent": "question"}
+{"text": "Do you allow pets", "intent": "question"}
+{"text": "what time are tours", "intent": "question"}
+{"text": "not interested", "intent": "other"}
+{"text": "thanks", "intent": "other"}
+{"text": "ok", "intent": "other"}
+{"text": "Either day is fine", "intent": "other"}
+{"text": "I'll get back to you next week", "intent": "other"}
+{"text": "", "intent": "other"}

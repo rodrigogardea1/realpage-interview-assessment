@@ -1,0 +1,14 @@
+# Problem Statement
+
+Build a context-aware message-sending bot that learns what to do only from input data.
+ 
+You are given a JSONL file (see sample.jsonl file) where each line is a test case:
+- Input: user profile, preferences, context, constraints
+- Expected: what message should be sent (or not sent), via which channel, and why
+
+Your job is to build an autonomous agent that:
+- Reads the input record
+- Decides if it should communicate
+- Decides how to communicate
+- Decides what to say
+- Produces output that semantically matches the expected result
