@@ -89,9 +89,10 @@ def _iter_strings(value: Any, path: str) -> Iterator[tuple[str, str]]:
             yield from _iter_strings(v, f"{path}[{i}]")
 
 
-def check_pii(text: str, record: Record) -> str | None:
+def check_pii(text: str, record: Record, decision: Decision | None = None) -> str | None:
     """No emails, phones, SSNs, addresses, unit numbers, and no profile values
-    beyond first_name and amenity_interest echoed into the copy."""
+    beyond first_name, amenity_interest, and the fields policy cleared into
+    decision.extra_context echoed into the copy."""
     if EMAIL_RE.search(text):
         return "pii_email"
     if SSN_RE.search(text):
@@ -105,11 +106,15 @@ def check_pii(text: str, record: Record) -> str | None:
     profile = record.input.profile.model_dump()
     profile.pop("first_name", None)
     profile.pop("amenity_interest", None)
+    cleared = set(decision.extra_context) if decision is not None else set()
     lowered = text.lower()
-    for path, value in _iter_strings(profile, "profile"):
-        v = value.strip().lower()
-        if len(v) >= 3 and v in lowered:
-            return f"pii_profile_field:{path}"
+    for key, field_value in profile.items():
+        if key in cleared:
+            continue  # policy already vetted this field for the generator
+        for path, value in _iter_strings(field_value, f"profile.{key}"):
+            v = value.strip().lower()
+            if len(v) >= 3 and v in lowered:
+                return f"pii_profile_field:{path}"
     return None
 
 
@@ -204,6 +209,9 @@ def check_injection(draft: Draft, record: Record, decision: Decision) -> str | N
                   record.input.timezone, record.input.language, *decision.amenities]
         if isinstance(v, str) and v.strip()
     }
+    for value in decision.extra_context.values():  # vetted by policy.build_extra_context
+        allowed.add(value.strip().lower())
+        allowed.update(part.strip().lower() for part in value.split(","))
     sources: dict[str, Any] = record.input.model_dump()
     sources["inbound_reply"] = record.inbound_reply
     sources["last_reply"] = record.last_reply
@@ -234,7 +242,7 @@ def run(draft: Draft, decision: Decision, record: Record) -> list[str]:
         check_length(draft.body, channel),
         check_subject(draft, channel),
         check_opt_out(draft.body, decision.opt_out_line),
-        check_pii(text, record),
+        check_pii(text, record, decision),
         check_cta(draft, decision),
         check_personalization(draft, decision),
         check_injection(draft, record, decision),

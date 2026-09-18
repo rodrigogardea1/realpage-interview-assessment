@@ -183,6 +183,8 @@ class Decision(BaseModel):
     booked_day: str | None = None
     opt_out_line: str = ""
     max_chars: int | None = None
+    # Bounded, sanitized leftovers from the record. Copy-only: policy never reads it.
+    extra_context: dict[str, str] = {}
 
 
 # ----------------------------------------------------------------- output side

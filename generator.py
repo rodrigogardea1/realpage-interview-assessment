@@ -31,7 +31,7 @@ DRAFT_SCHEMA: dict = {
 FACT_FIELDS = (
     "channel", "language", "persona", "message_kind", "first_name", "property_short_name",
     "move_timeframe", "amenities", "horizon", "tour_days", "tour_week_phrase", "booked_day",
-    "opt_out_line", "max_chars",
+    "opt_out_line", "max_chars", "extra_context",
 )
 DAY_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday",
              "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
