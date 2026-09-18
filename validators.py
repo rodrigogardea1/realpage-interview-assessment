@@ -157,10 +157,13 @@ def check_cta(draft: Draft, decision: Decision) -> str | None:
             return "cta_extra_link"
         if len(urls) != 1:
             return "cta_link_repeated"
-        # The CTA line: the line holding the link must be a call to action in
-        # words ending with "→ <link>", not a bare URL (R2: "Book now → <link>").
+        # The CTA line is "some words, then → <link>", not a bare URL
+        # (R2: "Book now → <link>"). Email gives the CTA its own line, so the
+        # link must end that line. An SMS body is a single line, so the link
+        # may be followed by punctuation and the opt-out sentence.
         cta_line = next((ln for ln in draft.body.splitlines() if cta.link in ln), "")
-        if not re.search(r"\S.*→\s*" + re.escape(cta.link) + r"[.,;:!]?\s*$", cta_line):
+        tail = r"[.,;:!]?\s*$" if decision.channel == "email" else r"[.,;:!]?(?:\s|$)"
+        if not re.search(r"\S.*→\s*" + re.escape(cta.link) + tail, cta_line):
             return "cta_line_missing"
         return None
     if urls:

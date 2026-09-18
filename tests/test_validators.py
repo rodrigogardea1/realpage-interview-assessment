@@ -299,3 +299,23 @@ def test_run_collects_multiple_violations():
     assert any(x.startswith("tone_exclamations") for x in v)
     assert any(x.startswith("fair_housing:familial_status") for x in v)
     assert any(x.startswith("fair_housing:ideal_tenant") for x in v)
+
+
+def test_cta_line_on_sms_may_be_followed_by_the_opt_out():
+    """Regression: an SMS body is one line, so the link cannot be at end-of-line."""
+    _, d, rec = setup(R1, persona="resident", lifecycle_stage="active", channel_preferences=["sms"],
+                      **{"consent.email_opt_in": False, "assertions.constraints.primary_cta": "renew_lease"})
+    link = "https://oakridge.example/renew"
+    assert d.channel == "sms" and d.cta.to_output() == {"type": "renew_lease", "link": link}
+    good = sms(f"Hi Taylor—your Oak Ridge lease is up for renewal. Renew now → {link} Reply STOP to opt out.")
+    assert check_cta(good, d) is None and run(good, d, rec) == []
+    assert check_cta(sms(f"Hi Taylor—renew now → {link}. Reply STOP to opt out."), d) is None  # trailing punctuation
+    assert check_cta(sms(f"Hi Taylor—renew here: {link} Reply STOP to opt out."), d) == "cta_line_missing"  # no arrow
+    assert check_cta(sms(f"{link} Reply STOP to opt out."), d) == "cta_line_missing"  # bare URL
+    assert check_cta(sms(f"Renew now → {link}/extra Reply STOP to opt out."), d) == "cta_link_missing"
+
+
+def test_cta_line_on_email_still_requires_end_of_line():
+    link = "https://oakridge.example/tour"
+    body = f"Hi Taylor,\nBook now → {link} before Friday\nTo opt out"
+    assert check_cta(Draft(subject="s", body=body), EMAIL_DECISION) == "cta_line_missing"

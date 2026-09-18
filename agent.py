@@ -134,6 +134,10 @@ def run(in_path: str | None, out_path: str | None, *, stdin: TextIO = sys.stdin,
         sink = Path(out_path).open("w", encoding="utf-8")
     else:
         sink = stdout
+    # Warm the real provider's connection once, outside any record's latency
+    # clock. Skipped for the stub provider and for empty input.
+    if source and llm.settings()["provider"] != "stub":
+        llm.warm()
     sent = total = 0
     try:
         for out in process_lines(source):

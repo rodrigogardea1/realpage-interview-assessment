@@ -152,6 +152,73 @@ def test_split_input_edge_shapes():
     assert agent.split_input("[1, 2]") == ["1", "2"]  # non-object elements become invalid_record lines
 
 
+def test_resident_sms_link_cta_sends_on_first_attempt():
+    """Regression: sms-only resident with a link CTA failed validation after 3 attempts."""
+    raw = json.loads(json.dumps(RAW[0]))
+    raw.pop("expected")
+    raw.update(task_id="resident_sms_renewal", persona="resident", lifecycle_stage="active",
+               channel_preferences=["sms"],
+               consent={"email_opt_in": False, "sms_opt_in": True, "voice_opt_in": False})
+    raw["assertions"]["constraints"]["primary_cta"] = "renew_lease"
+    out = agent.process_record(raw)
+    assert out["decision"]["send"] is True, out["decision"]
+    assert out["validation"]["attempts"] == 1
+    nm = out["next_message"]
+    assert nm["channel"] == "sms" and nm["subject"] is None
+    assert nm["cta"] == {"type": "renew_lease", "link": "https://oakridge.example/renew"}
+    assert "→ https://oakridge.example/renew" in nm["body"] and nm["body"].endswith("Reply STOP to opt out.")
+    assert out["next_action"] == {"type": "follow_up_in_days", "value": 3}
+
+
+def test_run_does_not_warm_the_stub_provider(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(llm, "warm", lambda: calls.append(1))
+    src = tmp_path / "in.jsonl"
+    src.write_text("\n".join(LINES))
+    assert agent.run(str(src), str(tmp_path / "o.jsonl")) == 0
+    assert calls == []
+
+
+def test_run_warms_a_real_provider_once_before_records(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(llm, "warm", lambda: events.append("warm"))
+    monkeypatch.setattr(agent, "process_lines", lambda lines: events.append("process") or iter(()))
+    src = tmp_path / "in.jsonl"
+    src.write_text(LINES[0])
+    assert agent.run(str(src), str(tmp_path / "o.jsonl")) == 0
+    assert events == ["warm", "process"]
+    events.clear()
+    (tmp_path / "empty.jsonl").write_text("")
+    agent.run(str(tmp_path / "empty.jsonl"), str(tmp_path / "o2.jsonl"))
+    assert "warm" not in events  # nothing to process, nothing to warm
+
+
+def test_warm_is_quiet_and_never_logs(monkeypatch, stub_env):
+    created = []
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            created.append(kwargs)
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    monkeypatch.setattr(llm, "_anthropic_client", lambda key: FakeClient())
+    assert llm.warm() is None and created == []          # stub provider: no request
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("LLM_MODEL", "claude-haiku-4-5")
+    assert llm.warm() is None
+    assert created == [{"model": "claude-haiku-4-5", "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}]
+    assert not (stub_env / "logs").exists()              # not logged as a task
+
+    def boom(key):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(llm, "_anthropic_client", boom)
+    assert llm.warm() is None                             # errors are swallowed
+
+
 def test_cli_stdin_stdout(stub_env):
     env = dict(os.environ, LLM_PROVIDER="stub", LLM_LOG_DIR=str(stub_env / "logs"))
     proc = subprocess.run([sys.executable, str(ROOT / "agent.py")], input="\n".join(LINES), capture_output=True,

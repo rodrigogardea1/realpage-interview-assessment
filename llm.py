@@ -170,6 +170,21 @@ def _stub(prompt: str, schema: dict, s: dict[str, Any]) -> dict:
     return {"subject": subject, "body": body}
 
 
+def warm() -> None:
+    """Open the provider connection before the first record so its TLS handshake
+    is not billed to that record's latency. One max_tokens=1 request. Never
+    raises, never logs to logs/, and does nothing for the stub provider."""
+    try:
+        s = settings()
+        if s["provider"] != "anthropic":
+            return
+        _anthropic_client(s["api_key"]).messages.create(
+            model=s["model"], max_tokens=1, messages=[{"role": "user", "content": "ok"}]
+        )
+    except Exception:  # noqa: BLE001 - warming is best effort
+        return
+
+
 PROVIDERS: dict[str, Callable[[str, dict, dict[str, Any]], dict]] = {"anthropic": _anthropic, "stub": _stub}
 
 
