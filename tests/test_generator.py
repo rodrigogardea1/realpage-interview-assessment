@@ -110,7 +110,8 @@ def test_settings_defaults(monkeypatch):
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.chdir("/")  # no .env here
     s = llm.settings()
-    assert s["provider"] == "anthropic" and s["model"] == "claude-opus-5" and s["temperature"] == 0.2
+    assert s["provider"] == "anthropic" and s["model"] == "claude-haiku-4-5" and s["temperature"] == 0.2
+    assert "opus" not in llm.DEFAULT_MODEL["anthropic"]  # a missing LLM_MODEL must never fall back to Opus
     assert not llm._supports_temperature("claude-opus-5") and llm._supports_temperature("claude-haiku-4-5")
     assert llm._supports_temperature("claude-sonnet-4-5") and llm._supports_temperature("claude-sonnet-4-6")
     assert llm._supports_effort("claude-opus-5") and llm._supports_effort("claude-sonnet-4-6")
@@ -131,3 +132,59 @@ def test_write_rejects_missing_body(monkeypatch):
     monkeypatch.setenv("LLM_STUB_RESPONSE", '{"subject": ""}')
     with pytest.raises(llm.LLMError):
         generator.write(DECISIONS["prospect_welcome_day0"])
+
+
+# ------------------------------------------------------------ tour days / CTA
+
+
+def make_decision(**overrides):
+    import copy
+    raw = copy.deepcopy(RAW[0]); raw.pop("expected", None)
+    for key, value in overrides.items():
+        node = raw
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    record = Record.model_validate(raw)
+    return resolve(record), record
+
+
+def test_cta_instruction_uses_resolved_days():
+    d, _ = make_decision(**{"input.tour_availability": ["Sat", "Sun"]})
+    text = generator.cta_instruction(d)
+    assert "Saturday and Sunday" in text and 'Reply 1 for Sat, 2 for Sun.' in text
+    assert "Thu" not in text
+
+
+def test_stub_body_with_custom_days_passes_validation():
+    d, rec = make_decision(**{"input.tour_availability": ["Sat", "Sun"]})
+    draft = generator.write(d)
+    assert "Reply 1 for Sat, 2 for Sun" in draft.body and "Saturday or Sunday" in draft.body
+    assert validators.run(draft, d, rec) == []
+
+
+def test_unknown_cta_type_is_passed_raw_without_a_derived_verb():
+    d, rec = make_decision(**{"assertions.constraints.primary_cta": "request_parking_permit",
+                              "channel_preferences": ["email"]})
+    text = generator.cta_instruction(d)
+    assert "This CTA is `request_parking_permit`." in text
+    assert "ending with `→ https://oakridge.example/request-parking-permit`" in text
+    assert "Request now" not in text and "Request →" not in text  # no verb fabricated from the prefix
+    assert "Learn more" not in text
+    system, user = generator.build_prompt(d)
+    assert "request_parking_permit" in user
+
+
+def test_known_cta_types_keep_fixed_verbs():
+    for cta_type, verb in generator.CTA_VERBS.items():
+        d, _ = make_decision(**{"assertions.constraints.primary_cta": cta_type, "channel_preferences": ["email"]})
+        assert f'"{verb} now → https://oakridge.example/' in generator.cta_instruction(d)
+
+
+def test_schedule_callback_stub_end_to_end():
+    d, rec = make_decision(**{"assertions.constraints.primary_cta": "schedule_callback", "channel_preferences": ["email"]})
+    assert d.cta.to_output() == {"type": "schedule_callback", "link": "https://oakridge.example/schedule-callback"}
+    draft = generator.write(d)
+    assert draft.body.count("https://oakridge.example/schedule-callback") == 1
+    assert validators.run(draft, d, rec) == []

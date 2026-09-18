@@ -130,6 +130,28 @@ def test_run_with_files_and_blank_lines(tmp_path):
     assert [o["task_id"] for o in outs] == [r["task_id"] for r in RAW]
 
 
+def test_json_array_input_is_accepted(tmp_path):
+    src = tmp_path / "in.json"
+    src.write_text(json.dumps(RAW, indent=2))  # pretty-printed array, not JSONL
+    dst = tmp_path / "out.jsonl"
+    assert agent.run(str(src), str(dst)) == 0
+    outs = [json.loads(l) for l in dst.read_text().splitlines()]
+    assert [o["task_id"] for o in outs] == [r["task_id"] for r in RAW]
+    assert all(o["decision"]["send"] for o in outs)
+    jsonl = list(agent.process_lines(LINES))
+    for a, b in zip(outs, jsonl):
+        a.pop("latency_ms"); b.pop("latency_ms")
+    assert outs == jsonl  # array and JSONL inputs produce identical output
+
+
+def test_split_input_edge_shapes():
+    assert agent.split_input("  [\n]") == []
+    assert agent.split_input('[{"task_id": "a"}]') == ['{"task_id": "a"}']
+    assert agent.split_input('{"task_id": "a"}\n{"task_id": "b"}') == ['{"task_id": "a"}', '{"task_id": "b"}']
+    assert agent.split_input("[not json") == ["[not json"]
+    assert agent.split_input("[1, 2]") == ["1", "2"]  # non-object elements become invalid_record lines
+
+
 def test_cli_stdin_stdout(stub_env):
     env = dict(os.environ, LLM_PROVIDER="stub", LLM_LOG_DIR=str(stub_env / "logs"))
     proc = subprocess.run([sys.executable, str(ROOT / "agent.py")], input="\n".join(LINES), capture_output=True,

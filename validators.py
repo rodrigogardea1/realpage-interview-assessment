@@ -56,8 +56,13 @@ FAIR_HOUSING_TERMS: list[tuple[str, re.Pattern[str]]] = [
     ("ideal_tenant", re.compile(r"\b(?:perfect|ideal|great|suited|designed|made)\s+for\b", re.IGNORECASE)),
 ]
 DAY_PATTERNS: dict[str, re.Pattern[str]] = {
-    "Thu": re.compile(r"\b(?:thu(?:rs(?:day)?)?|jue(?:ves)?)\b", re.IGNORECASE),
+    "Mon": re.compile(r"\b(?:mon(?:day)?|lun(?:es)?)\b", re.IGNORECASE),
+    "Tue": re.compile(r"\b(?:tue(?:s(?:day)?)?|mar(?:tes)?)\b", re.IGNORECASE),
+    "Wed": re.compile(r"\b(?:wed(?:s|nesday)?|mi[eé]r(?:coles)?)\b", re.IGNORECASE),
+    "Thu": re.compile(r"\b(?:thu(?:rs?(?:day)?)?|jue(?:ves)?)\b", re.IGNORECASE),
     "Fri": re.compile(r"\b(?:fri(?:day)?|vie(?:rnes)?)\b", re.IGNORECASE),
+    "Sat": re.compile(r"\b(?:sat(?:urday)?|s[aá]b(?:ado)?)\b", re.IGNORECASE),
+    "Sun": re.compile(r"\b(?:sun(?:day)?|dom(?:ingo)?)\b", re.IGNORECASE),
 }
 
 
@@ -150,6 +155,13 @@ def check_cta(draft: Draft, decision: Decision) -> str | None:
             return "cta_link_missing"
         if any(u != cta.link for u in urls):
             return "cta_extra_link"
+        if len(urls) != 1:
+            return "cta_link_repeated"
+        # The CTA line: the line holding the link must be a call to action in
+        # words ending with "→ <link>", not a bare URL (R2: "Book now → <link>").
+        cta_line = next((ln for ln in draft.body.splitlines() if cta.link in ln), "")
+        if not re.search(r"\S.*→\s*" + re.escape(cta.link) + r"[.,;:!]?\s*$", cta_line):
+            return "cta_line_missing"
         return None
     if urls:
         return "cta_unexpected_link"

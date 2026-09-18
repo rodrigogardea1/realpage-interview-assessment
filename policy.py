@@ -22,7 +22,18 @@ DEFAULT_CHANNEL_ORDER: tuple[str, ...] = ("sms", "email")      # assumption: emp
 HORIZON_SHORT_MAX_DAYS = 60                                      # assumption: 32 < 60 < 68
 FOLLOW_UP_DAYS: dict[str, int] = {"short": 2, "long": 3, "unknown": 3}
 RESIDENT_FOLLOW_UP_DAYS = 3
-TOUR_DAYS: list[str] = ["Thu", "Fri"]                            # R1
+TOUR_DAYS: list[str] = ["Thu", "Fri"]                            # R1 default
+TOUR_DAY_FIELDS: tuple[str, ...] = ("tour_availability", "available_tour_days", "tour_days")
+WEEKDAYS: tuple[str, ...] = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_DAY_ALIASES: dict[str, str] = {
+    "mon": "Mon", "monday": "Mon", "lunes": "Mon",
+    "tue": "Tue", "tues": "Tue", "tuesday": "Tue", "martes": "Tue",
+    "wed": "Wed", "weds": "Wed", "wednesday": "Wed", "miercoles": "Wed", "miércoles": "Wed",
+    "thu": "Thu", "thur": "Thu", "thurs": "Thu", "thursday": "Thu", "jueves": "Thu",
+    "fri": "Fri", "friday": "Fri", "viernes": "Fri",
+    "sat": "Sat", "saturday": "Sat", "sabado": "Sat", "sábado": "Sat",
+    "sun": "Sun", "sunday": "Sun", "domingo": "Sun",
+}
 CTA_TYPE_MAP: dict[str, str] = {"book_tour": "schedule_tour"}    # R1, R2
 CTA_LINK_PATH: dict[str, str] = {
     "schedule_tour": "tour",                                     # R2
@@ -78,6 +89,17 @@ def select_channel(preferences: list[str], consent: Consent) -> Channel | None:
         if pref in SENDABLE_CHANNELS and getattr(consent, f"{pref}_opt_in", False):
             return pref  # type: ignore[return-value]
     return None
+
+
+def channel_phrase(preferences: list[str], consent: Consent, channel: str) -> str:
+    """'sms consented and preferred' when the first preference was used, else
+    'email consented (sms preferred, not consented)' so the fall-through is visible."""
+    first = (preferences or list(DEFAULT_CHANNEL_ORDER))[0]
+    if first == channel:
+        return f"{channel} consented and preferred"
+    if first == "voice" and consent.voice_opt_in:
+        return f"{channel} consented ({first} preferred, requires agent)"
+    return f"{channel} consented ({first} preferred, not consented)"
 
 
 def resolve_timezone(name: str | None) -> tuple[ZoneInfo, str | None]:
@@ -138,10 +160,10 @@ def cta_link(property_name: str | None, cta_type: str) -> str:
     return f"https://{property_slug(property_name)}.example/{path}"
 
 
-def cta_for(cta_type: str, channel: str, property_name: str | None) -> Cta:
+def cta_for(cta_type: str, channel: str, property_name: str | None, days: list[str] | None = None) -> Cta:
     """SMS tour CTA -> numeric options; everything else -> link (R1, R2; decision 3)."""
     if channel == "sms" and cta_type == "schedule_tour":
-        return Cta(type=cta_type, options=list(TOUR_DAYS))
+        return Cta(type=cta_type, options=list(days or TOUR_DAYS))
     return Cta(type=cta_type, link=cta_link(property_name, cta_type))
 
 
@@ -169,10 +191,39 @@ def move_timeframe(move_date_target: date | None) -> str | None:
     return f"{part}-{move_date_target.strftime('%B')}"
 
 
-def tour_days(send_at: datetime) -> tuple[list[str], str]:
-    """Fixed Thu/Fri (R1); 'this week' for a Mon-Wed send, else 'next week'."""
-    phrase = "this week" if send_at.weekday() <= 2 else "next week"
-    return list(TOUR_DAYS), phrase
+def normalize_tour_days(raw: object) -> list[str]:
+    """['Thursday', 'fri', 'Sat'] -> ['Thu', 'Fri']: three-letter capitalized
+    abbreviations, unknown entries and duplicates dropped, first two kept.
+    Empty result means "use the R1 default"."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        day = _DAY_ALIASES.get(item.strip().lower().rstrip("."))
+        if day and day not in out:
+            out.append(day)
+    return out[:2]
+
+
+def tour_days_for(record_input: object) -> list[str]:
+    """First of input.tour_availability / available_tour_days / tour_days that
+    normalizes to a non-empty list; else the R1 default Thu/Fri."""
+    for field in TOUR_DAY_FIELDS:
+        days = normalize_tour_days(getattr(record_input, field, None))
+        if days:
+            return days
+    return list(TOUR_DAYS)
+
+
+def tour_days(send_at: datetime, days: list[str] | None = None) -> tuple[list[str], str]:
+    """Offered days (default Thu/Fri, R1) plus 'this week' when the first offered
+    day is still ahead in the send week, else 'next week'."""
+    days = list(days or TOUR_DAYS)
+    first = WEEKDAYS.index(days[0]) if days[0] in WEEKDAYS else 3
+    phrase = "this week" if send_at.weekday() < first else "next week"
+    return days, phrase
 
 
 def sanitize_name(raw: object) -> str | None:
@@ -246,13 +297,14 @@ def resolve(record: Record) -> Decision:
     if intent == "question":
         return _no_send(record, "question_requires_agent", {"type": "assign_to_agent"})
 
-    # 3. consent + channel
+    # 3. consent + channel. The consent check ran either way, so both
+    #    no-send outcomes still carry consent_verified.
+    states = list(POLICY_STATES)
     channel = select_channel(record.channel_preferences, record.consent)
     if channel is None:
         if record.consent.voice_opt_in:
-            return _no_send(record, "voice_requires_agent", {"type": "create_call_task"})
-        return _no_send(record, "no_consented_channel", {"type": "mark_uncontactable"})
-    states = list(POLICY_STATES)
+            return _no_send(record, "voice_requires_agent", {"type": "create_call_task"}, states)
+        return _no_send(record, "no_consented_channel", {"type": "mark_uncontactable"}, states)
 
     # 4. persona and required timing inputs
     if persona not in ("prospect", "resident"):
@@ -262,8 +314,10 @@ def resolve(record: Record) -> Decision:
     tz, tz_note = resolve_timezone(inp.timezone)
     li_local = inp.last_interaction.astimezone(tz)
     notes: list[str] = [tz_note] if tz_note else []
+    channel_text = channel_phrase(record.channel_preferences, record.consent, channel)
 
     cta_type = cta_type_for(record.assertions.constraints.primary_cta, persona)
+    offered_days = tour_days_for(inp)
     common = dict(
         task_id=record.task_id,
         persona=persona,
@@ -280,7 +334,7 @@ def resolve(record: Record) -> Decision:
     # 5a. resident: no horizon or tour logic
     if persona == "resident":
         send_at = compute_send_at(li_local, channel, delay_days(stage, "unknown", persona))
-        reason = f"{channel} consented and preferred; resident {stage}"
+        reason = f"{channel_text}; resident {stage}"
         return Decision(
             send=True,
             reason="; ".join([reason, *notes]),
@@ -298,7 +352,7 @@ def resolve(record: Record) -> Decision:
         horizon = compute_horizon(send_at.date(), inp.move_date_target)
         return Decision(
             send=True,
-            reason="; ".join([f"{channel} consented and preferred; booking reply for {day}", *notes]),
+            reason="; ".join([f"{channel_text}; booking reply for {day}", *notes]),
             send_at=send_at,
             horizon=horizon,
             cta=Cta(type="confirm_tour", options=[day]),
@@ -322,16 +376,16 @@ def resolve(record: Record) -> Decision:
         send_at = compute_send_at(li_local, channel, delay_days(stage, horizon, persona))
         horizon = compute_horizon(send_at.date(), inp.move_date_target)
 
-    days, week_phrase = tour_days(send_at)
+    days, week_phrase = tour_days(send_at, offered_days)
     days_out = (inp.move_date_target - send_at.date()).days if inp.move_date_target else None
     horizon_text = f"horizon {horizon}" + (f" ({days_out} days)" if days_out is not None else "")
-    reason = f"{channel} consented and preferred; prospect {stage}; {horizon_text}"
+    reason = f"{channel_text}; prospect {stage}; {horizon_text}"
     return Decision(
         send=True,
         reason="; ".join([reason, *notes]),
         send_at=send_at,
         horizon=horizon,
-        cta=cta_for(cta_type, channel, inp.property_name),
+        cta=cta_for(cta_type, channel, inp.property_name, days),
         next_action=next_action_for(stage, horizon, persona),
         move_timeframe=move_timeframe(inp.move_date_target),
         tour_days=days,

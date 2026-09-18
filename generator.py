@@ -33,7 +33,10 @@ FACT_FIELDS = (
     "move_timeframe", "amenities", "horizon", "tour_days", "tour_week_phrase", "booked_day",
     "opt_out_line", "max_chars",
 )
-DAY_NAMES = {"Thu": "Thursday", "Fri": "Friday"}
+DAY_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday",
+             "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
+# Known CTA types get a fixed verb. Anything else is passed to the model as a
+# raw identifier; no verb is ever derived from the identifier's prefix.
 CTA_VERBS = {"schedule_tour": "Book", "renew_lease": "Renew", "pay_balance": "Pay", "schedule_maintenance": "Schedule"}
 
 
@@ -49,14 +52,16 @@ def cta_instruction(decision: Decision) -> str:
         numbered = ", ".join(f"{i} for {d}" for i, d in enumerate(cta.options, start=1))
         phrase = decision.tour_week_phrase or "this week"
         return f"invite a tour {phrase} on {days} and end the CTA with \"Reply {numbered}.\" No links."
-    verb = CTA_VERBS.get(cta.type, "Learn more")
-    line = f"\"{verb} now → {cta.link}\"" if verb != "Learn more" else f"\"Learn more → {cta.link}\""
     urgency = ""
     if decision.horizon == "short" and decision.tour_days:
         urgency = f" Invite them to visit {decision.tour_week_phrase or 'this week'}."
     elif decision.horizon in ("long", "unknown") and decision.persona == "prospect":
         urgency = " Keep it low-pressure; do not name specific days."
-    return f"the CTA line is {line}, using this exact link once.{urgency}"
+    verb = CTA_VERBS.get(cta.type)
+    if verb:
+        return f"the CTA line is \"{verb} now → {cta.link}\", using this exact link once.{urgency}"
+    return (f"This CTA is `{cta.type}`. Write one short, natural call-to-action line in plain words for that "
+            f"action, ending with `→ {cta.link}`. Use the link exactly once.{urgency}")
 
 
 def facts_for(decision: Decision) -> dict:

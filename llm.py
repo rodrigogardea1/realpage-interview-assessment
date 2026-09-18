@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 DEFAULT_PROVIDER = "anthropic"
-DEFAULT_MODEL = {"anthropic": "claude-opus-5", "stub": "stub"}
+DEFAULT_MODEL = {"anthropic": "claude-haiku-4-5", "stub": "stub"}  # never Opus: latency threshold
 DEFAULT_TEMPERATURE = 0.2
 MAX_TOKENS = 8000  # adaptive thinking counts against max_tokens
 SYSTEM_PROMPT = "You write short, compliant outbound messages for apartment leasing teams. Return only JSON."
@@ -141,25 +141,32 @@ def _stub(prompt: str, schema: dict, s: dict[str, Any]) -> dict:
     opt_out = facts["opt_out_line"]
     cta = facts.get("cta") or {}
     week = facts.get("tour_week_phrase") or "this week"
+    day_names = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday",
+                 "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
+    days = facts.get("tour_days") or ["Thu", "Fri"]
+    day_text = " or ".join(day_names.get(d, d) for d in days)
+    reply_text = ", ".join(f"{i} for {d}" for i, d in enumerate(days, start=1))
     timeframe = facts.get("move_timeframe")
     amenities = facts.get("amenities") or []
     amenity_text = " and ".join(amenities) if len(amenities) <= 2 else ", ".join(amenities[:-1]) + f", and {amenities[-1]}"
     if facts.get("channel") == "sms":
         if cta.get("type") == "confirm_tour":
-            day = {"Thu": "Thursday", "Fri": "Friday"}.get((cta.get("options") or ["Thu"])[0], "Thursday")
+            day = day_names.get((cta.get("options") or ["Thu"])[0], "Thursday")
             body = f"Hi {name}—you're set for a tour of {prop} on {day}. We'll text you a time shortly. {opt_out}"
         elif cta.get("options"):
             body = (f"Hi {name}—welcome to {prop}! Tours are available {week}. Would you like to book a time on "
-                    f"Thursday or Friday? Reply 1 for Thu, 2 for Fri. {opt_out}")
+                    f"{day_text}? Reply {reply_text}. {opt_out}")
         else:
-            body = f"Hi {name}—a quick note from {prop}. When you have a moment: {cta.get('link', '')} {opt_out}"
+            body = f"Hi {name}—a quick note from {prop}. Take the next step → {cta.get('link', '')} {opt_out}"
         return {"subject": "", "body": body}
     subject = f"Tour {prop}" + (f"—see the {amenity_text} you asked about" if amenities else " this week")
     lead = f"Since you're planning a {timeframe} move, " if timeframe else ""
     look = f"here's a quick look at our {amenity_text}." if amenities else "here's a quick look at what we offer."
-    verb = "Book" if cta.get("type") in ("schedule_tour", None) else "Go"
+    verbs = {"schedule_tour": "Book now", "renew_lease": "Renew now", "pay_balance": "Pay now",
+             "schedule_maintenance": "Schedule now"}
+    cta_line = verbs.get(cta.get("type"), "Take the next step")
     body = (f"Hi {name},\n{lead}{look} Book a visit {week} to compare floor plans.\n"
-            f"{verb} now → {cta.get('link', '')}\n{opt_out}")
+            f"{cta_line} → {cta.get('link', '')}\n{opt_out}")
     return {"subject": subject, "body": body}
 
 

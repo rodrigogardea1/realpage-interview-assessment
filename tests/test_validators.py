@@ -192,8 +192,31 @@ def test_cta_sms_rejects_links():
 def test_cta_email_requires_the_exact_link():
     assert check_cta(Draft(subject="s", body="Book now. To opt out..."), EMAIL_DECISION) == "cta_link_missing"
     assert check_cta(Draft(subject="s", body="Book now → https://oakridge.example/tours"), EMAIL_DECISION) == "cta_link_missing"
-    assert check_cta(Draft(subject="s", body="https://oakridge.example/tour and https://other.example/x"), EMAIL_DECISION) == "cta_extra_link"
+    assert check_cta(Draft(subject="s", body="Book now → https://oakridge.example/tour and https://other.example/x"), EMAIL_DECISION) == "cta_extra_link"
     assert check_cta(Draft(subject="s", body="Book now → https://oakridge.example/tour."), EMAIL_DECISION) is None
+
+
+def test_cta_line_must_be_a_call_to_action_with_the_link():
+    link = "https://oakridge.example/tour"
+    assert check_cta(Draft(subject="s", body=f"Hi Taylor,\nCome see us.\n{link}\nTo opt out"), EMAIL_DECISION) == "cta_line_missing"
+    assert check_cta(Draft(subject="s", body=f"Hi Taylor,\nSee {link} for details.\nTo opt out"), EMAIL_DECISION) == "cta_line_missing"
+    assert check_cta(Draft(subject="s", body=f"Hi Taylor,\nBook now → {link}\nTo opt out"), EMAIL_DECISION) is None
+    assert check_cta(Draft(subject="s", body=f"Hi Taylor,\nReserve your visit → {link}.\nTo opt out"), EMAIL_DECISION) is None
+    assert check_cta(Draft(subject="s", body=f"Book now → {link}\nAgain: {link}"), EMAIL_DECISION) == "cta_link_repeated"
+    assert check_cta(EMAIL_DRAFT, EMAIL_DECISION) is None  # R2 line "Book now → <link>"
+
+
+def test_cta_options_for_custom_days_in_english_and_spanish():
+    d = SMS_DECISION.model_copy(update={"cta": SMS_DECISION.cta.model_copy(update={"options": ["Sat", "Sun"]})})
+    assert check_cta(sms("Tour Saturday or Sunday? Reply 1 for Sat, 2 for Sun."), d) is None
+    assert check_cta(sms("¿Sábado o domingo? Responde 1 para sábado, 2 para domingo."), d) is None
+    assert check_cta(sms("Tour Saturday? Reply 1 for Sat."), d) == "cta_option_missing:Sun"
+    for day, sample in [("Mon", "Monday"), ("Tue", "Tuesday"), ("Wed", "Wednesday"), ("Thu", "Thursday"),
+                        ("Fri", "Friday"), ("Sat", "Saturday"), ("Sun", "Sunday")]:
+        assert validators.DAY_PATTERNS[day].search(sample), day
+    for day, sample in [("Mon", "lunes"), ("Tue", "martes"), ("Wed", "miércoles"), ("Thu", "jueves"),
+                        ("Fri", "viernes"), ("Sat", "sábado"), ("Sun", "domingo")]:
+        assert validators.DAY_PATTERNS[day].search(sample), day
 
 
 def test_cta_missing_when_decision_has_none():

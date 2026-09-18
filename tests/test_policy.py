@@ -14,8 +14,8 @@ import policy
 from models import Consent, Record
 from policy import (
     classify_reply, compute_horizon, compute_send_at, final_states, move_timeframe,
-    property_short_name, property_slug, resolve, sanitize_amenities, sanitize_name,
-    select_channel, tour_days,
+    normalize_tour_days, property_short_name, property_slug, resolve, sanitize_amenities,
+    sanitize_name, select_channel, tour_days, tour_days_for,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -107,6 +107,18 @@ def test_channel_falls_through_to_next_consented_preference():
     assert d.send and d.channel == "email"
     # Mon 09:04 local is before the 10:00 email window, so it snaps to the same day.
     assert d.send_at.isoformat() == "2025-12-08T10:00:00-06:00"
+    assert d.reason.startswith("email consented (sms preferred, not consented); prospect new")
+
+
+def test_reason_keeps_plain_wording_when_first_preference_used():
+    assert resolve(make(R1)).reason.startswith("sms consented and preferred; ")
+    assert resolve(make(R2)).reason.startswith("email consented and preferred; ")
+    d = resolve(make(R1, **{"channel_preferences": ["voice", "sms"], "consent.voice_opt_in": True}))
+    assert d.reason.startswith("sms consented (voice preferred, requires agent); ")
+    d = resolve(make(R1, **{"channel_preferences": ["voice", "sms"]}))
+    assert d.reason.startswith("sms consented (voice preferred, not consented); ")
+    d = resolve(make(R1, persona="resident", lifecycle_stage="active", **{"consent.sms_opt_in": False}))
+    assert d.reason == "email consented (sms preferred, not consented); resident active"
 
 
 def test_channel_respects_preference_order_when_all_consented():
@@ -143,7 +155,7 @@ def no_send(d, reason, next_action):
 def test_no_consented_channel():
     d = resolve(make(R1, **{"consent.sms_opt_in": False, "consent.email_opt_in": False}))
     no_send(d, "no_consented_channel", {"type": "mark_uncontactable"})
-    assert d.states_verified == []
+    assert d.states_verified == ["consent_verified"]  # the check ran; it found nothing consented
 
 
 def test_missing_consent_block_means_no_consent():
@@ -157,11 +169,13 @@ def test_voice_only_consent_creates_call_task():
         "consent.sms_opt_in": False, "consent.email_opt_in": False, "consent.voice_opt_in": True,
     }))
     no_send(d, "voice_requires_agent", {"type": "create_call_task"})
+    assert d.states_verified == ["consent_verified"]
 
 
 def test_do_not_contact_beats_everything():
     d = resolve(make(R1, lifecycle_stage="do_not_contact"))
     no_send(d, "do_not_contact", {"type": "mark_uncontactable"})
+    assert d.states_verified == []  # gated before the consent check ran
 
 
 @pytest.mark.parametrize("stage", ["closed", "leased"])
@@ -459,3 +473,50 @@ def test_unknown_language_falls_back_to_english_opt_out():
 def test_missing_property_name_still_sends():
     d = resolve(make(R2, **{"input.property_name": DELETE}))
     assert d.send and d.cta.link == "https://ourcommunity.example/tour"
+
+
+# ---------------------------------------------------------------- tour days
+
+
+def test_normalize_tour_days():
+    assert normalize_tour_days(["Thursday", "fri", "Sat"]) == ["Thu", "Fri"]
+    assert normalize_tour_days(["Sat", "Sun"]) == ["Sat", "Sun"]
+    assert normalize_tour_days(["saturday", "SUNDAY", "sunday"]) == ["Sat", "Sun"]  # dedupe
+    assert normalize_tour_days(["jueves", "viernes"]) == ["Thu", "Fri"]
+    assert normalize_tour_days(["Tues.", "Weds"]) == ["Tue", "Wed"]
+    assert normalize_tour_days(["someday", 3, None]) == []
+    assert normalize_tour_days("Thu") == [] and normalize_tour_days(None) == []
+    assert normalize_tour_days(["nope", "Mon"]) == ["Mon"]  # one valid day is kept
+
+
+def test_tour_days_for_field_priority_and_default():
+    assert tour_days_for(make(R1).input) == ["Thu", "Fri"]
+    assert tour_days_for(make(R1, **{"input.tour_availability": ["Sat", "Sun"]}).input) == ["Sat", "Sun"]
+    assert tour_days_for(make(R1, **{"input.available_tour_days": ["Monday", "Wednesday"]}).input) == ["Mon", "Wed"]
+    assert tour_days_for(make(R1, **{"input.tour_days": ["Tue"]}).input) == ["Tue"]
+    rec = make(R1, **{"input.tour_availability": [], "input.available_tour_days": ["Sun"]})
+    assert tour_days_for(rec.input) == ["Sun"]  # empty list falls through to the next field
+    rec = make(R1, **{"input.tour_availability": ["bogus"]})
+    assert tour_days_for(rec.input) == ["Thu", "Fri"]  # all-invalid list falls back to the default
+
+
+def test_record_tour_availability_drives_cta_options():
+    d = resolve(make(R1, **{"input.tour_availability": ["Sat", "Sun"]}))
+    assert d.tour_days == ["Sat", "Sun"]
+    assert d.cta.to_output() == {"type": "schedule_tour", "options": ["Sat", "Sun"]}
+    assert d.tour_week_phrase == "this week"  # Tue send, Sat is ahead
+    d = resolve(make(R1, **{"input.tour_availability": ["Mon", "Tue"]}))
+    assert d.tour_week_phrase == "next week"  # Tue send, Mon already passed
+    email = resolve(make(R1, **{"channel_preferences": ["email"], "input.tour_availability": ["Sat", "Sun"]}))
+    assert email.cta.link and email.tour_days == ["Sat", "Sun"]  # link CTA keeps the days for copy
+
+
+def test_sample_records_keep_default_tour_days():
+    assert resolve(make(R1)).cta.options == ["Thu", "Fri"]
+    assert resolve(make(R2)).tour_days == ["Thu", "Fri"]
+
+
+def test_tour_days_phrase_with_custom_days():
+    assert tour_days(local(2025, 12, 9, 9), ["Sat", "Sun"]) == (["Sat", "Sun"], "this week")
+    assert tour_days(local(2025, 12, 13, 9), ["Sat", "Sun"])[1] == "next week"   # Sat send
+    assert tour_days(local(2025, 12, 9, 9), ["Mon"])[1] == "next week"

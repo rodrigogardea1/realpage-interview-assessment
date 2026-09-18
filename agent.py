@@ -114,8 +114,21 @@ def process_lines(lines: Iterable[str]) -> Iterable[dict[str, Any]]:
             yield _failed_line(str(raw.get("task_id") or f"unknown-line-{n}"), "agent_error", start)
 
 
+def split_input(text: str) -> list[str]:
+    """JSONL by default; a JSON array (text starts with '[') becomes one line per element.
+    Output is always JSONL either way."""
+    if text.lstrip().startswith("["):
+        try:
+            items = json.loads(text)
+        except json.JSONDecodeError:
+            return text.splitlines()  # let process_lines report invalid_json per line
+        if isinstance(items, list):
+            return [json.dumps(item, ensure_ascii=False) for item in items]
+    return text.splitlines()
+
+
 def run(in_path: str | None, out_path: str | None, *, stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> int:
-    source = Path(in_path).read_text(encoding="utf-8").splitlines() if in_path else stdin.read().splitlines()
+    source = split_input(Path(in_path).read_text(encoding="utf-8") if in_path else stdin.read())
     if out_path:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         sink = Path(out_path).open("w", encoding="utf-8")
