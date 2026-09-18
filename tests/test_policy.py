@@ -154,13 +154,15 @@ def no_send(d, reason, next_action):
 
 def test_no_consented_channel():
     d = resolve(make(R1, **{"consent.sms_opt_in": False, "consent.email_opt_in": False}))
-    no_send(d, "no_consented_channel", {"type": "mark_uncontactable"})
+    # holdout resident_opt_out_respected supersedes the earlier mark_uncontactable assumption
+    no_send(d, "no_consented_channel", {"type": "no_op", "reason": "no_contact_consent"})
+    assert d.empty_message is True
     assert d.states_verified == ["consent_verified"]  # the check ran; it found nothing consented
 
 
 def test_missing_consent_block_means_no_consent():
     d = resolve(make(R1, consent=DELETE))
-    no_send(d, "no_consented_channel", {"type": "mark_uncontactable"})
+    no_send(d, "no_consented_channel", {"type": "no_op", "reason": "no_contact_consent"})
 
 
 def test_voice_only_consent_creates_call_task():
@@ -207,10 +209,15 @@ def test_move_date_on_send_date_still_sends():
     assert d.send and d.horizon == "short"
 
 
-def test_missing_last_interaction_flags_for_review():
+def test_missing_last_interaction_never_blocks_a_send():
+    """Superseded by the holdout: ten of its records have no last_interaction and all
+    but the no-consent one send. The anchor falls back to as_of, an input timestamp, now."""
+    from datetime import datetime, timezone
     for value in [DELETE, None, "not a date"]:
-        d = resolve(make(R1, **{"input.last_interaction": value}))
-        no_send(d, "missing_last_interaction", {"type": "flag_for_review"})
+        d = resolve(make(R1, **{"input.last_interaction": value}),
+                    as_of=datetime(2025, 12, 9, 14, 0, tzinfo=timezone.utc))   # 08:00 Chicago
+        assert d.send and d.send_at.isoformat() == "2025-12-09T09:00:00-06:00"
+        assert d.anchor_source == "as_of" and "anchor 2025-12-09T08:00:00-06:00 (as_of)" in d.reason
 
 
 def test_unsupported_persona_flags_for_review():
@@ -345,7 +352,8 @@ def test_missing_move_date_behaves_as_long_horizon():
     assert d.send and d.horizon == "unknown" and d.move_timeframe is None
     assert d.next_action == {"type": "start_cadence", "name": "prospect_welcome_long_horizon"}
     d = resolve(make(R2, **{"input.move_date_target": None}))
-    assert d.horizon == "unknown" and d.next_action == {"type": "follow_up_in_days", "value": 3}
+    # holdout prospect_spanish_locale: open + no move date -> follow up in 2, not 3
+    assert d.horizon == "unknown" and d.next_action == {"type": "follow_up_in_days", "value": 2}
 
 
 def test_unparseable_move_date_is_treated_as_missing():
@@ -390,7 +398,8 @@ def test_resident_passes_cta_through_with_link_and_follow_up():
     assert d.send and d.channel == "email" and d.horizon is None
     assert d.cta.to_output() == {"type": "renew_lease", "link": "https://oakridge.example/renew"}
     assert d.next_action == {"type": "follow_up_in_days", "value": 3}
-    assert d.send_at.isoformat() == "2025-12-09T10:00:00-06:00"  # Sat 05:30 + 3d -> Tue 10:00
+    # "active" is not in the stage table -> unknown stage: delay 0 (was an assumed +3 before the holdout)
+    assert d.send_at.isoformat() == "2025-12-06T10:00:00-06:00"  # Sat 05:30 -> Sat 10:00
     assert d.tour_days is None and d.move_timeframe is None
 
 

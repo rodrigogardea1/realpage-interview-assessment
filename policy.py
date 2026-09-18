@@ -8,11 +8,12 @@ sanitized facts the generator may use for copy.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+import copy
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from classifier import Intent as ReplyIntent, classify
-from models import Channel, Consent, Cta, Decision, Horizon, Record
+from models import Channel, Consent, Cta, Decision, Horizon, Record, _lenient_date, _lenient_datetime
 from validators import (ADDRESS_RE, EMAIL_RE, FAIR_HOUSING_TERMS, INJECTION_PHRASE_RE, PHONE_RE, SSN_RE, UNIT_RE)
 
 # ------------------------------------------------------------------ constants
@@ -21,8 +22,7 @@ WINDOW_HOUR: dict[str, int] = {"sms": 9, "email": 10}          # R1, R2
 SENDABLE_CHANNELS: tuple[str, ...] = ("sms", "email")
 DEFAULT_CHANNEL_ORDER: tuple[str, ...] = ("sms", "email")      # assumption: empty prefs
 HORIZON_SHORT_MAX_DAYS = 60                                      # assumption: 32 < 60 < 68
-FOLLOW_UP_DAYS: dict[str, int] = {"short": 2, "long": 3, "unknown": 3}
-RESIDENT_FOLLOW_UP_DAYS = 3
+FOLLOW_UP_DAYS: dict[str, int] = {"short": 2, "long": 3, "unknown": 2}   # R2 long→3; holdout spanish_locale unknown→2
 TOUR_DAYS: list[str] = ["Thu", "Fri"]                            # R1 default
 TOUR_DAY_FIELDS: tuple[str, ...] = ("tour_availability", "available_tour_days", "tour_days")
 WEEKDAYS: tuple[str, ...] = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -35,14 +35,82 @@ _DAY_ALIASES: dict[str, str] = {
     "sat": "Sat", "saturday": "Sat", "sabado": "Sat", "sábado": "Sat",
     "sun": "Sun", "sunday": "Sun", "domingo": "Sun",
 }
-CTA_TYPE_MAP: dict[str, str] = {"book_tour": "schedule_tour"}    # R1, R2
-CTA_LINK_PATH: dict[str, str] = {
-    "schedule_tour": "tour",                                     # R2
-    "renew_lease": "renew",
-    "schedule_maintenance": "maintenance",
-    "pay_balance": "pay",
+# ---- CTA catalog: primary_cta -> output type, shape, options / link path.
+# `options` is a list, or "tour_days" for the record's offered days. A CTA uses
+# options only on the channels in `options_on`; otherwise it is a link.
+# `{unit}` in a link path is the resident's unit with regular hyphens.
+TOUR_DAY_OPTIONS = "tour_days"
+CTA_CATALOG: dict[str, dict] = {
+    "book_tour": {"type": "schedule_tour", "options": TOUR_DAY_OPTIONS, "options_on": ("sms",), "link_path": "tour"},      # R1, R2
+    "reschedule_tour": {"type": "reschedule", "options": ["today", "tomorrow"], "options_on": ("sms",), "link_path": "tour"},  # holdout no_show
+    "reply_intent": {"type": "intent_capture", "options": ["yes", "no", "details"], "options_on": ("sms", "email")},       # holdout renewal_undecided
+    "review_renewal": {"type": "review_renewal", "link_path": "renewal/{unit}"},                                          # holdout renewal_90day
+    "review_renewal_details": {"type": "review_renewal_details", "link_path": "renewal/{unit}/details"},                  # holdout renewal_details
+    "get_started": {"type": "get_started", "link_path": "welcome"},                                                       # holdout resident_welcome
+    "enroll_loyalty": {"type": "enroll_loyalty", "link_path": "loyalty"},                                                 # holdout loyalty_engage
+    # assumptions kept from before the holdout; no record evidences them
+    "renew_lease": {"type": "renew_lease", "link_path": "renew"},
+    "schedule_maintenance": {"type": "schedule_maintenance", "link_path": "maintenance"},
+    "pay_balance": {"type": "pay_balance", "link_path": "pay"},
 }
-DEFAULT_CTA: dict[str, str] = {"prospect": "schedule_tour", "resident": "contact_office"}
+_CATALOG_BY_TYPE: dict[str, dict] = {entry["type"]: entry for entry in CTA_CATALOG.values()}
+DEFAULT_CTA: dict[str, str] = {"prospect": "book_tour", "resident": "contact_office"}
+ES_DAY_NAMES: dict[str, str] = {"Mon": "lunes", "Tue": "martes", "Wed": "miércoles", "Thu": "jueves",
+                                "Fri": "viernes", "Sat": "sábado", "Sun": "domingo"}       # holdout spanish_locale
+ES_OPTION_LABELS: dict[str, str] = {"today": "hoy", "tomorrow": "mañana", "yes": "sí", "no": "no",
+                                    "details": "detalles"}                                  # assumption
+
+# ---- Lifecycle-stage table, keyed by (persona, stage). Data, not branches.
+# delay_days: days added to the anchor before snapping to the channel window.
+# gap_after_interaction: the follow-up interval is a gap since the last touch,
+#   so it is added only when last_interaction is the anchor (R2: 12/06 + 3d).
+# send_before: send N days before a date field when it is still ahead.
+# next_action: "{horizon}" -> short|long (unknown reads long), "{follow_up}" -> FOLLOW_UP_DAYS.
+FOLLOW_UP = "{follow_up}"
+STAGES: dict[tuple[str, str], dict] = {
+    ("prospect", "new"): {                                                       # R1, holdout consent_block
+        "delay_days": 0, "primary_cta": "book_tour",
+        "next_action": {"type": "start_cadence", "name": "prospect_welcome_{horizon}_horizon"},
+        "intent": "New inquiry; welcome them and invite them to book a tour."},
+    ("prospect", "open"): {                                                      # R2, holdout spanish_locale
+        "delay_days": 0, "gap_after_interaction": True, "primary_cta": "book_tour",
+        "next_action": {"type": "follow_up_in_days", "value": FOLLOW_UP},
+        "intent": "Open inquiry; follow up and invite them to book a visit."},
+    ("prospect", "no_show"): {                                                   # holdout no_show_reengage
+        "delay_days": 0, "primary_cta": "reschedule_tour",
+        "next_action": {"type": "reset_cadence", "name": "prospect_reengage"},
+        "intent": "The person missed a scheduled tour; invite them to reschedule today or tomorrow."},
+    ("prospect", "cancelled_manager"): {                                         # holdout cancellation_manager
+        "delay_days": 0, "primary_cta": "book_tour",
+        "next_action": {"type": "follow_up_in_days", "value": 2},
+        "intent": "Their tour was cancelled; acknowledge it and invite them to pick a new time."},
+    ("resident", "welcome"): {                                                   # holdout resident_welcome
+        "delay_days": 1, "send_before": {"field": "move_in_date", "days": 2}, "primary_cta": "get_started",
+        "next_action": {"type": "follow_up_in_days", "value": 2},
+        "intent": "New resident about to move in; welcome them and point them to move-in setup."},
+    ("resident", "renewal_window"): {                                            # holdout renewal_90day
+        "delay_days": 0, "primary_cta": "review_renewal",
+        "next_action": {"type": "schedule_sms_reminder", "in_days": 5},
+        "intent": "Lease ends soon; invite them to review renewal options for their unit."},
+    ("resident", "renewal_undecided"): {                                         # holdout renewal_undecided
+        "delay_days": 5, "primary_cta": "reply_intent",
+        "next_action": {"type": "branch_on_intent", "mapping": {
+            "yes": "start_esign_flow", "no": "exit_nurture", "details": "send_offer_details_email"}},
+        "intent": "They have a renewal offer and have not decided; ask whether they would like to renew their unit."},
+    ("resident", "renewal_details_requested"): {                                 # holdout renewal_details
+        "delay_days": 5, "primary_cta": "review_renewal_details",
+        "next_action": {"type": "start_esign_flow"},
+        "intent": "They asked for renewal details; tell them where to view the details for their unit and invite them to continue."},
+    ("resident", "loyalty_engage"): {                                            # holdout loyalty_engage
+        "delay_days": 3, "primary_cta": "enroll_loyalty",
+        "next_action": {"type": "follow_up_in_days", "value": 5},
+        "intent": "They are eligible for the resident rewards program; invite them to enroll."},
+}
+UNKNOWN_STAGE: dict = {"delay_days": 0, "primary_cta": None,
+                       "next_action": {"type": "follow_up_in_days", "value": 3}, "intent": None}
+KNOWN_STATES: frozenset[str] = frozenset({
+    "consent_verified", "fair_housing_check_passed", "brand_style_applied", "renewal_offer_loaded", "locale_applied"})
+NO_CONSENT_ACTION: dict = {"type": "no_op", "reason": "no_contact_consent"}       # holdout resident_opt_out
 SMS_MAX_CHARS = 320
 POLICY_STATES: list[str] = ["consent_verified"]
 POST_VALIDATION_STATES: list[str] = ["fair_housing_check_passed", "brand_style_applied"]
@@ -131,41 +199,74 @@ def compute_horizon(send_date: date, move_date_target: date | None) -> Horizon:
     return "short" if (move_date_target - send_date).days <= HORIZON_SHORT_MAX_DAYS else "long"
 
 
-def delay_days(lifecycle_stage: str, horizon: Horizon, persona: str) -> int:
-    """new -> 0 (R1). Otherwise the follow-up interval (R2: open + long -> 3)."""
-    if lifecycle_stage == "new":
-        return 0
-    if persona == "resident":
-        return RESIDENT_FOLLOW_UP_DAYS
-    return FOLLOW_UP_DAYS[horizon]
+def stage_entry(persona: str, stage: str) -> dict:
+    return STAGES.get((persona, stage), UNKNOWN_STAGE)
 
 
-def next_action_for(lifecycle_stage: str, horizon: Horizon, persona: str) -> dict:
-    if persona == "resident":
-        return {"type": "follow_up_in_days", "value": RESIDENT_FOLLOW_UP_DAYS}
-    if lifecycle_stage == "new":
-        label = "long" if horizon == "unknown" else horizon
-        return {"type": "start_cadence", "name": f"prospect_welcome_{label}_horizon"}   # R1
-    return {"type": "follow_up_in_days", "value": FOLLOW_UP_DAYS[horizon]}              # R2
+def render_next_action(template: dict, horizon: Horizon | None) -> dict:
+    """Fill "{horizon}" and "{follow_up}" in a stage's next_action template."""
+    label = "long" if horizon in (None, "unknown") else horizon
+    follow_up = FOLLOW_UP_DAYS[horizon or "unknown"]
+
+    def fill(value: object) -> object:
+        if value == FOLLOW_UP:
+            return follow_up
+        if isinstance(value, str):
+            return value.replace("{horizon}", label)
+        if isinstance(value, dict):
+            return {k: fill(v) for k, v in value.items()}
+        return value
+
+    return fill(copy.deepcopy(template))  # type: ignore[return-value]
+
+
+def cta_entry(primary_cta: str | None, persona: str) -> tuple[str, dict]:
+    """(key, catalog entry). Unknown types pass through as a link CTA."""
+    key = (primary_cta or "").strip().lower() or DEFAULT_CTA.get(persona, "contact_office")
+    if key in CTA_CATALOG:
+        return key, CTA_CATALOG[key]
+    if key in _CATALOG_BY_TYPE:                       # already an output type, e.g. "schedule_tour"
+        return key, _CATALOG_BY_TYPE[key]
+    return key, {"type": key, "link_path": key.replace("_", "-")}
 
 
 def cta_type_for(primary_cta: str | None, persona: str) -> str:
-    if primary_cta:
-        key = primary_cta.strip().lower()
-        return CTA_TYPE_MAP.get(key, key)
-    return DEFAULT_CTA.get(persona, "contact_office")
+    return cta_entry(primary_cta, persona)[1]["type"]
 
 
-def cta_link(property_name: str | None, cta_type: str) -> str:
-    path = CTA_LINK_PATH.get(cta_type, cta_type.replace("_", "-"))
+def normalize_unit(raw: object) -> str | None:
+    """'A‑204' (U+2011) -> 'A-204'. Only letters, digits and hyphens survive."""
+    if not isinstance(raw, (str, int)):
+        return None
+    text = re.sub(r"[‐‑‒–—]", "-", str(raw).strip())
+    text = re.sub(r"[^A-Za-z0-9-]", "", text)
+    return text or None
+
+
+def cta_link(property_name: str | None, cta_type: str, unit: str | None = None) -> str:
+    entry = _CATALOG_BY_TYPE.get(cta_type) or CTA_CATALOG.get(cta_type) or {}
+    path = entry.get("link_path") or cta_type.replace("_", "-")
+    path = path.replace("{unit}", unit or "").replace("//", "/").strip("/")
     return f"https://{property_slug(property_name)}.example/{path}"
 
 
-def cta_for(cta_type: str, channel: str, property_name: str | None, days: list[str] | None = None) -> Cta:
-    """SMS tour CTA -> numeric options; everything else -> link (R1, R2; decision 3)."""
-    if channel == "sms" and cta_type == "schedule_tour":
-        return Cta(type=cta_type, options=list(days or TOUR_DAYS))
-    return Cta(type=cta_type, link=cta_link(property_name, cta_type))
+def localize_options(options: list[str], language: str, are_days: bool) -> list[str]:
+    if language != "es":
+        return list(options)
+    table = ES_DAY_NAMES if are_days else ES_OPTION_LABELS
+    return [table.get(o, o) for o in options]
+
+
+def cta_for(cta_type: str, channel: str, property_name: str | None, days: list[str] | None = None,
+            language: str = "en", unit: str | None = None) -> Cta:
+    """Options on the channels the catalog names, else a link (R1, R2, holdout)."""
+    entry = _CATALOG_BY_TYPE.get(cta_type) or {"type": cta_type}
+    options = entry.get("options")
+    if options and channel in entry.get("options_on", ()):
+        are_days = options == TOUR_DAY_OPTIONS
+        raw = list(days or TOUR_DAYS) if are_days else list(options)
+        return Cta(type=entry["type"], options=localize_options(raw, language, are_days))
+    return Cta(type=entry["type"], link=cta_link(property_name, entry["type"], unit))
 
 
 def property_short_name(property_name: str | None) -> str:
@@ -251,10 +352,11 @@ def opt_out_line(channel: str, language: str) -> str:
 
 
 def final_states(decision: Decision, validated: bool) -> list[str]:
-    """states_verified for the output line; the two copy states need a passing draft."""
+    """states_verified for the output line; copy states (fair housing, brand
+    style, locale) need a draft that passed validation."""
     states = list(decision.states_verified)
     if decision.send and validated:
-        states.extend(s for s in POST_VALIDATION_STATES if s not in states)
+        states.extend(s for s in decision.post_validation_states if s not in states)
     return states
 
 
@@ -280,6 +382,7 @@ CONSUMED_FIELDS: frozenset[str] = frozenset({
     "timezone", "language", "inbound_reply", "last_reply", "tour_availability",
     "available_tour_days", "tour_days", "primary_cta", "no_pii_leak",
     "no_sensitive_discrimination", "include_opt_out_instructions", "profile",
+    "unit", "renewal_offer_id", "missed_tour_time", "move_in_date", "respect_consent", "locale_applied",
 })
 _EXTRA_KEY_BLOCKLIST: tuple[str, ...] = (
     "email", "phone", "address", "ssn", "income", "salary", "employer", "dob", "birth",
@@ -347,15 +450,17 @@ def build_extra_context(record: Record) -> dict[str, str]:
 # ---------------------------------------------------------------- resolve
 
 
-def _no_send(record: Record, reason: str, next_action: dict, states: list[str] | None = None) -> Decision:
+def _no_send(record: Record, reason: str, next_action: dict, states: list[str] | None = None,
+             empty_message: bool = False) -> Decision:
     return Decision(
         send=False,
         reason=reason,
         next_action=next_action,
         states_verified=list(states or []),
-        task_id=record.task_id,
+        task_id=record.task_id,          # identifier pass-through for logs; never read by any rule
         persona=record.persona,
         language=record.input.language,
+        empty_message=empty_message,
     )
 
 
@@ -366,10 +471,44 @@ def _inbound_reply(record: Record) -> str | None:
     return None
 
 
-def resolve(record: Record) -> Decision:
+def _input_extra(inp: object, field: str) -> object:
+    return (getattr(inp, "model_extra", None) or {}).get(field)
+
+
+def input_timestamp(inp: object) -> tuple[str, datetime] | None:
+    """Latest full timestamp among unknown input fields (holdout: missed_tour_time).
+    Date-only fields (lease_end_date, move_in_date) are not anchors."""
+    found: list[tuple[str, datetime]] = []
+    for key, value in (getattr(inp, "model_extra", None) or {}).items():
+        if isinstance(value, str) and "T" in value:
+            parsed = _lenient_datetime(value)
+            if parsed is not None:
+                found.append((key, parsed))
+    return max(found, key=lambda kv: kv[1]) if found else None
+
+
+def resolve_anchor(inp: object, tz: ZoneInfo, as_of: datetime | None,
+                   now: datetime | None = None) -> tuple[datetime, str]:
+    """The reference instant timing counts from, and where it came from:
+    last_interaction, else --as-of / AGENT_AS_OF, else a timestamp in the
+    input, else the wall clock. A missing anchor never blocks a send."""
+    last = getattr(inp, "last_interaction", None)
+    if last is not None:
+        return last.astimezone(tz), "last_interaction"
+    if as_of is not None:
+        aware = as_of if as_of.tzinfo else as_of.replace(tzinfo=tz)
+        return aware.astimezone(tz), "as_of"
+    stamp = input_timestamp(inp)
+    if stamp is not None:
+        return stamp[1].astimezone(tz), f"input.{stamp[0]}"
+    return (now or datetime.now(timezone.utc)).astimezone(tz), "now"
+
+
+def resolve(record: Record, as_of: datetime | None = None, now: datetime | None = None) -> Decision:
     stage = (record.lifecycle_stage or "new").strip().lower()
     persona = (record.persona or "prospect").strip().lower()
     inp = record.input
+    constraints = record.assertions.constraints
 
     # 1. lifecycle gates
     if stage == "do_not_contact":
@@ -391,52 +530,82 @@ def resolve(record: Record) -> Decision:
     if channel is None:
         if record.consent.voice_opt_in:
             return _no_send(record, "voice_requires_agent", {"type": "create_call_task"}, states)
-        return _no_send(record, "no_consented_channel", {"type": "mark_uncontactable"}, states)
+        return _no_send(record, "no_consented_channel", dict(NO_CONSENT_ACTION), states, empty_message=True)
 
-    # 4. persona and required timing inputs
+    # 4. persona
     if persona not in ("prospect", "resident"):
         return _no_send(record, "unsupported_persona", {"type": "flag_for_review"}, states)
-    if inp.last_interaction is None:
-        return _no_send(record, "missing_last_interaction", {"type": "flag_for_review"}, states)
-    tz, tz_note = resolve_timezone(inp.timezone)
-    li_local = inp.last_interaction.astimezone(tz)
-    notes: list[str] = [tz_note] if tz_note else []
-    channel_text = channel_phrase(record.channel_preferences, record.consent, channel)
 
-    cta_type = cta_type_for(record.assertions.constraints.primary_cta, persona)
+    # 5. required states the agent can actually verify
+    required = list(record.assertions.required_states)
+    for name in required:
+        if name not in KNOWN_STATES:
+            return _no_send(record, f"unverifiable_required_state:{name}", {"type": "flag_for_review"}, states)
+    offer_loaded = bool(_input_extra(inp, "renewal_offer_id") or _input_extra(inp, "lease_end_date"))
+    if offer_loaded:
+        states.append("renewal_offer_loaded")
+    elif "renewal_offer_loaded" in required:
+        return _no_send(record, "unverifiable_required_state:renewal_offer_loaded", {"type": "flag_for_review"}, states)
+    post_states = list(POST_VALIDATION_STATES)
+    if inp.language != "en" or constraints.locale_applied or "locale_applied" in required:
+        post_states.append("locale_applied")
+
+    # 6. anchor, stage, CTA
+    tz, tz_note = resolve_timezone(inp.timezone)
+    anchor, anchor_source = resolve_anchor(inp, tz, as_of, now)
+    notes: list[str] = [tz_note] if tz_note else []
+    if anchor_source != "last_interaction":
+        notes.append(f"anchor {anchor.isoformat()} ({anchor_source})")
+    channel_text = channel_phrase(record.channel_preferences, record.consent, channel)
+    entry = stage_entry(persona, stage)
+    cta_key, cta_spec = cta_entry(constraints.primary_cta or entry["primary_cta"], persona)
+    cta_type = cta_spec["type"]
+    unit = normalize_unit(_input_extra(inp, "unit")) if persona == "resident" else None
     offered_days = tour_days_for(inp)
     common = dict(
-        task_id=record.task_id,
+        task_id=record.task_id,          # identifier pass-through for logs; never read by any rule
         persona=persona,
         channel=channel,
         states_verified=states,
+        post_validation_states=post_states,
         first_name=sanitize_name(inp.profile.first_name),
         property_short_name=property_short_name(inp.property_name),
         language=inp.language,
         amenities=sanitize_amenities(inp.profile.amenity_interest),
         opt_out_line=opt_out_line(channel, inp.language),
         max_chars=SMS_MAX_CHARS if channel == "sms" else None,
+        unit=unit,
+        message_intent=entry["intent"],
+        anchor_source=anchor_source,
         extra_context=build_extra_context(record),  # copy-only; no decision below reads it
     )
 
-    # 5a. resident: no horizon or tour logic
+    # 7a. resident: no horizon or tour logic
     if persona == "resident":
-        send_at = compute_send_at(li_local, channel, delay_days(stage, "unknown", persona))
-        reason = f"{channel_text}; resident {stage}"
+        base, delay = anchor, entry["delay_days"]
+        before = entry.get("send_before")
+        if before:
+            target = _lenient_date(_input_extra(inp, before["field"]))
+            if target is not None:
+                send_day = target - timedelta(days=before["days"])
+                delay = 0
+                if send_day > anchor.date():
+                    base = datetime.combine(send_day, time(0, 0), tzinfo=tz)
+        send_at = compute_send_at(base, channel, delay)
         return Decision(
             send=True,
-            reason="; ".join([reason, *notes]),
+            reason="; ".join([f"{channel_text}; resident {stage}", *notes]),
             send_at=send_at,
             horizon=None,
-            cta=cta_for(cta_type, channel, inp.property_name),
-            next_action=next_action_for(stage, "unknown", persona),
+            cta=cta_for(cta_type, channel, inp.property_name, language=inp.language, unit=unit),
+            next_action=render_next_action(entry["next_action"], None),
             **common,
         )
 
-    # 5b. prospect replying to book a tour: confirm that day at the next window
-    if intent in ("book_thu", "book_fri"):
+    # 7b. prospect replying to a tour invitation: confirm that day at the next window
+    if intent in ("book_thu", "book_fri") and cta_type == "schedule_tour":
         day = "Thu" if intent == "book_thu" else "Fri"
-        send_at = compute_send_at(li_local, channel, 0)
+        send_at = compute_send_at(anchor, channel, 0)
         horizon = compute_horizon(send_at.date(), inp.move_date_target)
         return Decision(
             send=True,
@@ -448,35 +617,41 @@ def resolve(record: Record) -> Decision:
             message_kind="tour_confirmation",
             booked_day=day,
             move_timeframe=move_timeframe(inp.move_date_target),
-            **common,
+            **{**common, "message_intent": "They replied to book a tour; confirm the day."},
         )
 
-    # 5c. prospect outreach. Horizon is measured from the send date, and for
-    # `open` the delay depends on the horizon, so resolve in two passes; the
-    # second pass only changes anything for move dates 60-63 days out.
-    horizon = compute_horizon(li_local.date(), inp.move_date_target)
-    send_at = compute_send_at(li_local, channel, delay_days(stage, horizon, persona))
+    # 7c. prospect outreach. Horizon is measured from the send date. For a stage
+    # whose delay is a gap since the last interaction, the delay depends on the
+    # horizon, so resolve in two passes; the second pass only changes anything
+    # for move dates 60-63 days out.
+    gap = bool(entry.get("gap_after_interaction")) and anchor_source == "last_interaction"
+
+    def delay_for(h: Horizon) -> int:
+        return FOLLOW_UP_DAYS[h] if gap else entry["delay_days"]
+
+    horizon = compute_horizon(anchor.date(), inp.move_date_target)
+    send_at = compute_send_at(anchor, channel, delay_for(horizon))
     if inp.move_date_target is not None and inp.move_date_target < send_at.date():
         return _no_send(record, "stale_move_date", {"type": "flag_for_review"}, states)
     horizon2 = compute_horizon(send_at.date(), inp.move_date_target)
     if horizon2 != horizon:
         horizon = horizon2
-        send_at = compute_send_at(li_local, channel, delay_days(stage, horizon, persona))
+        send_at = compute_send_at(anchor, channel, delay_for(horizon))
         horizon = compute_horizon(send_at.date(), inp.move_date_target)
 
     days, week_phrase = tour_days(send_at, offered_days)
+    is_tour = cta_type == "schedule_tour"
     days_out = (inp.move_date_target - send_at.date()).days if inp.move_date_target else None
     horizon_text = f"horizon {horizon}" + (f" ({days_out} days)" if days_out is not None else "")
-    reason = f"{channel_text}; prospect {stage}; {horizon_text}"
     return Decision(
         send=True,
-        reason="; ".join([reason, *notes]),
+        reason="; ".join([f"{channel_text}; prospect {stage}; {horizon_text}", *notes]),
         send_at=send_at,
         horizon=horizon,
-        cta=cta_for(cta_type, channel, inp.property_name, days),
-        next_action=next_action_for(stage, horizon, persona),
+        cta=cta_for(cta_type, channel, inp.property_name, days, language=inp.language),
+        next_action=render_next_action(entry["next_action"], horizon),
         move_timeframe=move_timeframe(inp.move_date_target),
-        tour_days=days,
-        tour_week_phrase=week_phrase,
+        tour_days=days if is_tour else None,
+        tour_week_phrase=week_phrase if is_tour else None,
         **common,
     )

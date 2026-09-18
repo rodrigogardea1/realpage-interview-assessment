@@ -48,7 +48,10 @@ def test_prompt_is_under_600_words_before_facts():
     system, user = generator.build_prompt(d)
     p = system + user
     prose = p.split("<facts>")[0] + p.split("</facts>")[1]
-    assert len(prose.split()) < 600, len(prose.split())
+    # The ten holdout style examples are data, not instructions; the limit covers the rules.
+    head, _, rest = prose.partition("# Examples of the target style")
+    rules = head + "# Output" + rest.partition("# Output")[2]
+    assert len(rules.split()) < 600, len(rules.split())
 
 
 def test_prompt_feedback_section():

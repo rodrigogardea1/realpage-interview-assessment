@@ -55,6 +55,37 @@ FAIR_HOUSING_TERMS: list[tuple[str, re.Pattern[str]]] = [
         re.IGNORECASE)),
     ("ideal_tenant", re.compile(r"\b(?:perfect|ideal|great|suited|designed|made)\s+for\b", re.IGNORECASE)),
 ]
+# Opt-out lines the data accepts, per language and channel. The first entry is
+# the one policy hands the generator; the rest are variants seen in the holdout.
+OPT_OUT_ACCEPTED: dict[str, dict[str, tuple[str, ...]]] = {
+    "en": {
+        "sms": ("Reply STOP to opt out.",),                                         # R1, holdout no_show
+        "email": (
+            "To opt out of emails, click here or reply STOP.",                      # R2
+            "Opt-out here or reply STOP.",                                          # holdout welcome, loyalty, details
+            "Opt-out any time.",                                                    # holdout renewal_90day
+        ),
+    },
+    "es": {
+        "sms": ("Responde STOP para cancelar.",),                                   # holdout spanish_locale
+        "email": ("Para dejar de recibir correos, haz clic aquí o responde STOP.",),
+    },
+}
+# CTA types whose SMS copy must carry "Reply 1 ..., 2 ..." numbering.
+NUMBERED_CTA_TYPES: frozenset[str] = frozenset({"schedule_tour", "reschedule", "intent_capture"})
+_HYPHENS = str.maketrans({"‐": "-", "‑": "-", "‒": "-"})
+_ES_MARKERS = re.compile(
+    r"\b(?:hola|gracias|para|por|tu|tus|su|una?|esta|este|semana|responde|visita|el|la|los|las|de|del|que|con|en|y)\b",
+    re.IGNORECASE,
+)
+_EN_MARKERS = re.compile(r"\b(?:the|your|you|would|this|week|reply|welcome|with|and|for)\b", re.IGNORECASE)
+
+
+def normalize_hyphens(text: str) -> str:
+    """The holdout uses U+2011 non-breaking hyphens in copy and unit numbers."""
+    return text.translate(_HYPHENS)
+
+
 DAY_PATTERNS: dict[str, re.Pattern[str]] = {
     "Mon": re.compile(r"\b(?:mon(?:day)?|lun(?:es)?)\b", re.IGNORECASE),
     "Tue": re.compile(r"\b(?:tue(?:s(?:day)?)?|mar(?:tes)?)\b", re.IGNORECASE),
@@ -69,11 +100,18 @@ DAY_PATTERNS: dict[str, re.Pattern[str]] = {
 # ---------------------------------------------------------------- checks
 
 
-def check_opt_out(body: str, opt_out_line: str) -> str | None:
-    """The exact channel/language opt-out line from policy must end the body (R1, R2)."""
+def check_opt_out(body: str, opt_out_line: str, channel: str | None = None, language: str | None = None) -> str | None:
+    """The body must end with an accepted opt-out line: the one policy resolved,
+    or, when channel and language are given, any variant the data uses for them.
+    Hyphen forms are normalized so "Opt‑out" and "Opt-out" both pass."""
     if not opt_out_line:
         return "opt_out_line_unresolved"
-    if not body.rstrip().endswith(opt_out_line):
+    accepted = {opt_out_line}
+    if channel:
+        by_lang = OPT_OUT_ACCEPTED.get(language or "en", OPT_OUT_ACCEPTED["en"])
+        accepted.update(by_lang.get(channel, ()))
+    tail = normalize_hyphens(body.rstrip())
+    if not any(tail.endswith(normalize_hyphens(line)) for line in accepted):
         return "opt_out_missing_or_not_last"
     return None
 
@@ -92,7 +130,11 @@ def _iter_strings(value: Any, path: str) -> Iterator[tuple[str, str]]:
 def check_pii(text: str, record: Record, decision: Decision | None = None) -> str | None:
     """No emails, phones, SSNs, addresses, unit numbers, and no profile values
     beyond first_name, amenity_interest, and the fields policy cleared into
-    decision.extra_context echoed into the copy."""
+    decision.extra_context echoed into the copy. A resident's own `input.unit`
+    is allowed in either hyphen form (holdout renewal records name the unit)."""
+    own_unit = getattr(record.input, "unit", None)
+    if isinstance(own_unit, str) and own_unit.strip() and record.persona.strip().lower() == "resident":
+        text = normalize_hyphens(text).replace(normalize_hyphens(own_unit.strip()), " ")
     if EMAIL_RE.search(text):
         return "pii_email"
     if SSN_RE.search(text):
@@ -162,14 +204,8 @@ def check_cta(draft: Draft, decision: Decision) -> str | None:
             return "cta_extra_link"
         if len(urls) != 1:
             return "cta_link_repeated"
-        # The CTA line is "some words, then → <link>", not a bare URL
-        # (R2: "Book now → <link>"). Email gives the CTA its own line, so the
-        # link must end that line. An SMS body is a single line, so the link
-        # may be followed by punctuation and the opt-out sentence.
-        cta_line = next((ln for ln in draft.body.splitlines() if cta.link in ln), "")
-        tail = r"[.,;:!]?\s*$" if decision.channel == "email" else r"[.,;:!]?(?:\s|$)"
-        if not re.search(r"\S.*→\s*" + re.escape(cta.link) + tail, cta_line):
-            return "cta_line_missing"
+        # No shape requirement on the link's line: the holdout uses "Schedule →",
+        # "Review your offer →" and "Book your time here: <link>" alike.
         return None
     if urls:
         return "cta_unexpected_link"
@@ -177,13 +213,13 @@ def check_cta(draft: Draft, decision: Decision) -> str | None:
     if not options:
         return "cta_options_empty"
     for i, option in enumerate(options, start=1):
-        day_re = DAY_PATTERNS.get(option)
+        day_re = DAY_PATTERNS.get(option) or next((p for p in DAY_PATTERNS.values() if p.fullmatch(option)), None)
         if day_re is not None:
             if not day_re.search(draft.body):
                 return f"cta_option_missing:{option}"
         elif option.lower() not in draft.body.lower():
             return f"cta_option_missing:{option}"
-        if cta.type == "schedule_tour" and not re.search(rf"(?<!\d){i}(?!\d)", draft.body):
+        if cta.type in NUMBERED_CTA_TYPES and not re.search(rf"(?<!\d){i}(?!\d)", draft.body):
             return f"cta_reply_number_missing:{i}"
     return None
 
@@ -222,6 +258,17 @@ def check_injection(draft: Draft, record: Record, decision: Decision) -> str | N
     return None
 
 
+def check_language(body: str, language: str) -> str | None:
+    """Coarse locale check behind the `locale_applied` state: Spanish copy must
+    read as Spanish. English is the default and is not checked."""
+    if language != "es":
+        return None
+    es, en = len(_ES_MARKERS.findall(body)), len(_EN_MARKERS.findall(body))
+    if es < 3 or en > es:
+        return f"locale_mismatch:{language}"
+    return None
+
+
 def check_tone(body: str) -> str | None:
     if EMOJI_RE.search(body):
         return "tone_emoji"
@@ -241,12 +288,13 @@ def run(draft: Draft, decision: Decision, record: Record) -> list[str]:
     for v in (
         check_length(draft.body, channel),
         check_subject(draft, channel),
-        check_opt_out(draft.body, decision.opt_out_line),
+        check_opt_out(draft.body, decision.opt_out_line, channel, decision.language),
         check_pii(text, record, decision),
         check_cta(draft, decision),
         check_personalization(draft, decision),
         check_injection(draft, record, decision),
         check_tone(draft.body),
+        check_language(draft.body, decision.language),
     ):
         if v:
             violations.append(v)

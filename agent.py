@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, TextIO
 
@@ -22,7 +24,7 @@ import generator
 import llm
 import policy
 import validators
-from models import Decision, Draft, NextMessage, OutputLine, Record
+from models import EMPTY_MESSAGE, Decision, Draft, NextMessage, OutputLine, Record, _lenient_datetime
 
 MAX_ATTEMPTS = 3  # one draft plus two retries with violations fed back
 FAIL_ACTION = {"type": "flag_for_review"}
@@ -35,6 +37,8 @@ def _elapsed_ms(start: float) -> int:
 def _line(decision: Decision, *, draft: Draft | None, violations: list[str], attempts: int,
           validated: bool, reason: str, start: float) -> dict[str, Any]:
     next_message = None
+    if decision.empty_message:   # holdout: a no-consent line carries the channel:"none" shape, not null
+        next_message = NextMessage(**EMPTY_MESSAGE)
     if validated and draft is not None and decision.cta is not None and decision.send_at is not None:
         next_message = NextMessage(
             channel=decision.channel or "",
@@ -60,7 +64,18 @@ def _failed_line(task_id: str, reason: str, start: float) -> dict[str, Any]:
     return _line(decision, draft=None, violations=[], attempts=0, validated=False, reason=reason, start=start)
 
 
-def process_record(raw: dict[str, Any]) -> dict[str, Any]:
+def parse_as_of(value: str | None) -> datetime | None:
+    """--as-of / AGENT_AS_OF: an ISO-8601 instant. A naive value is read in the record's timezone."""
+    if not value or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
+    except ValueError as e:
+        raise ValueError(f"--as-of / AGENT_AS_OF is not an ISO-8601 timestamp: {value!r}") from e
+
+
+def process_record(raw: dict[str, Any], as_of: datetime | None = None) -> dict[str, Any]:
     start = time.perf_counter()
     task_id = str(raw.get("task_id") or "unknown") if isinstance(raw, dict) else "unknown"
     try:
@@ -68,7 +83,7 @@ def process_record(raw: dict[str, Any]) -> dict[str, Any]:
     except ValidationError:
         return _failed_line(task_id, "invalid_record", start)
 
-    decision = policy.resolve(record)
+    decision = policy.resolve(record, as_of=as_of)
     if not decision.send:
         return _line(decision, draft=None, violations=[], attempts=0, validated=False,
                      reason=decision.reason, start=start)
@@ -94,7 +109,7 @@ def process_record(raw: dict[str, Any]) -> dict[str, Any]:
                  reason=reason, start=start)
 
 
-def process_lines(lines: Iterable[str]) -> Iterable[dict[str, Any]]:
+def process_lines(lines: Iterable[str], as_of: datetime | None = None) -> Iterable[dict[str, Any]]:
     for n, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -108,7 +123,7 @@ def process_lines(lines: Iterable[str]) -> Iterable[dict[str, Any]]:
             yield _failed_line(f"unknown-line-{n}", "invalid_record", start)
             continue
         try:
-            yield process_record(raw)
+            yield process_record(raw, as_of)
         except Exception as e:  # noqa: BLE001 - never let one record kill the run
             print(f"[agent] line {n}: {type(e).__name__}: {e}", file=sys.stderr)
             yield _failed_line(str(raw.get("task_id") or f"unknown-line-{n}"), "agent_error", start)
@@ -127,7 +142,8 @@ def split_input(text: str) -> list[str]:
     return text.splitlines()
 
 
-def run(in_path: str | None, out_path: str | None, *, stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> int:
+def run(in_path: str | None, out_path: str | None, *, as_of: datetime | None = None,
+        stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> int:
     source = split_input(Path(in_path).read_text(encoding="utf-8") if in_path else stdin.read())
     if out_path:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +156,7 @@ def run(in_path: str | None, out_path: str | None, *, stdin: TextIO = sys.stdin,
         llm.warm()
     sent = total = 0
     try:
-        for out in process_lines(source):
+        for out in (process_lines(source, as_of) if as_of is not None else process_lines(source)):
             sink.write(json.dumps(out, ensure_ascii=False) + "\n")
             sink.flush()
             total += 1
@@ -156,8 +172,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Outreach agent: JSONL in, JSONL out.")
     parser.add_argument("--in", dest="in_path", help="input JSONL (default: stdin)")
     parser.add_argument("--out", dest="out_path", help="output JSONL (default: stdout)")
+    parser.add_argument("--as-of", dest="as_of", help="reference 'now' for records with no last_interaction "
+                        "(ISO-8601; default: AGENT_AS_OF env, else a timestamp in the record, else the clock)")
     args = parser.parse_args(argv)
-    return run(args.in_path, args.out_path)
+    try:
+        as_of = parse_as_of(args.as_of or os.getenv("AGENT_AS_OF"))
+    except ValueError as e:
+        parser.error(str(e))
+    return run(args.in_path, args.out_path, as_of=as_of)
 
 
 if __name__ == "__main__":

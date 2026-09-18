@@ -39,6 +39,13 @@ DEFAULT_THRESHOLDS = {
 HARD_FIELDS = ("send", "channel", "send_at", "cta", "next_action", "states")
 
 
+def expects_send(expected: dict[str, Any]) -> bool:
+    """The holdout marks a no-send with a channel:"none" message, the older fixtures with null."""
+    msg = expected.get("next_message")
+    default = msg is not None and msg.get("channel") != "none"
+    return bool(expected.get("decision", {}).get("send", default))
+
+
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return [json.loads(l) for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
 
@@ -49,14 +56,14 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
 def hard_fields(out: dict[str, Any], expected: dict[str, Any], required_states: list[str]) -> dict[str, bool]:
     exp_msg = expected.get("next_message")
     got_msg = out.get("next_message")
-    exp_send = expected.get("decision", {}).get("send", exp_msg is not None)
+    exp_send = expects_send(expected)
     result = {
-        "send": bool(out["decision"]["send"]) == bool(exp_send),
+        "send": bool(out["decision"]["send"]) == exp_send,
         "next_action": out.get("next_action") == expected.get("next_action"),
-        "states": set(required_states) <= set(out.get("states_verified", [])) if exp_send else True,
+        "states": set(required_states) <= set(out.get("states_verified", [])),
     }
-    if exp_msg is None or got_msg is None:
-        same = (exp_msg is None) == (got_msg is None)
+    if not exp_send or not got_msg or got_msg.get("channel") == "none":
+        same = got_msg == exp_msg          # null == null, or the exact channel:"none" shape
         result.update(channel=same, send_at=same, cta=same)
     else:
         result.update(
@@ -67,10 +74,20 @@ def hard_fields(out: dict[str, Any], expected: dict[str, Any], required_states: 
     return result
 
 
+def same_send_day(out: dict[str, Any], expected: dict[str, Any]) -> bool:
+    """Informational, not a hard field: same local calendar day. The holdout's minutes
+    (09:15, 13:00) are not derivable from the input, so this separates a "minute" miss
+    from a "day" miss."""
+    exp_at = (expected.get("next_message") or {}).get("send_at")
+    got_at = (out.get("next_message") or {}).get("send_at")
+    return str(exp_at)[:10] == str(got_at)[:10]
+
+
 def judge_body(out: dict[str, Any], expected: dict[str, Any], task_id: str, *, use_judge: bool) -> float:
     exp_msg, got_msg = expected.get("next_message"), out.get("next_message")
-    if exp_msg is None or got_msg is None:
-        return 1.0 if (exp_msg is None) == (got_msg is None) else 0.0
+    got_send = bool(got_msg) and got_msg.get("channel") != "none"
+    if not expects_send(expected) or not got_send:
+        return 1.0 if expects_send(expected) == got_send else 0.0
     if not use_judge:
         return 1.0
     exp_text = (f"Subject: {exp_msg['subject']}\n" if exp_msg.get("subject") else "") + exp_msg["body"]
@@ -92,7 +109,7 @@ def judge_body(out: dict[str, Any], expected: dict[str, Any], task_id: str, *, u
 def safety_violations(out: dict[str, Any], raw: dict[str, Any]) -> int:
     """Re-run the deterministic guardrails on what was emitted."""
     msg = out.get("next_message")
-    if not msg:
+    if not msg or not msg.get("body"):
         return 0
     record = Record.model_validate(raw)
     decision = resolve(record)
@@ -129,7 +146,8 @@ def p95(values: list[int | float]) -> float:
 
 def strictest_thresholds(records: list[dict[str, Any]]) -> dict[str, float]:
     t = dict(DEFAULT_THRESHOLDS)
-    seen = [r.get("thresholds", {}) for r in records if r.get("thresholds")]
+    seen = [{**r.get("assertions", {}).get("thresholds", {}), **r.get("thresholds", {})} for r in records]
+    seen = [x for x in seen if x]
     if seen:
         t["p95_latency_ms"] = min(x.get("p95_latency_ms", t["p95_latency_ms"]) for x in seen)
         t["personalization_score_min"] = max(x.get("personalization_score_min", t["personalization_score_min"]) for x in seen)
@@ -142,13 +160,13 @@ def strictest_thresholds(records: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def evaluate(records: list[dict[str, Any]], outputs: dict[str, dict[str, Any]] | None, *,
-             use_judge: bool, replies_path: str | Path | None) -> dict[str, Any]:
+             use_judge: bool, replies_path: str | Path | None, as_of: Any = None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for raw in records:
         if "expected" not in raw:
             continue
         task_id = raw["task_id"]
-        out = outputs[task_id] if outputs and task_id in outputs else agent.process_record(raw)
+        out = outputs[task_id] if outputs and task_id in outputs else agent.process_record(raw, as_of)
         required = raw.get("assertions", {}).get("required_states", [])
         hard = hard_fields(out, raw["expected"], required)
         rows.append({
@@ -156,6 +174,7 @@ def evaluate(records: list[dict[str, Any]], outputs: dict[str, dict[str, Any]] |
             "send": out["decision"]["send"],
             "reason": out["decision"]["reason"],
             "hard": hard,
+            "send_day": same_send_day(out, raw["expected"]),
             "semantic": judge_body(out, raw["expected"], task_id, use_judge=use_judge),
             "safety": safety_violations(out, raw),
             "latency_ms": out["latency_ms"],
@@ -182,12 +201,12 @@ def evaluate(records: list[dict[str, Any]], outputs: dict[str, dict[str, Any]] |
 
 def format_report(report: dict[str, Any]) -> str:
     mark = lambda ok: "ok" if ok else "FAIL"  # noqa: E731
-    header = f"{'task':32} {'send':5} {'chan':4} {'at':4} {'cta':4} {'act':4} {'st':4} {'sem':5} {'safe':4} {'try':3} {'ms':>6}"
+    header = f"{'task':42} {'send':5} {'chan':4} {'at':4} {'day':4} {'cta':4} {'act':4} {'st':4} {'sem':5} {'safe':4} {'try':3} {'ms':>6}"
     lines = [header, "-" * len(header)]
     for r in rows_sorted(report["rows"]):
         h = r["hard"]
         lines.append(
-            f"{r['task_id'][:32]:32} {mark(h['send']):5} {mark(h['channel']):4} {mark(h['send_at']):4} "
+            f"{r['task_id'][:42]:42} {mark(h['send']):5} {mark(h['channel']):4} {mark(h['send_at']):4} {mark(r['send_day']):4} "
             f"{mark(h['cta']):4} {mark(h['next_action']):4} {mark(h['states']):4} {r['semantic']:5.2f} "
             f"{r['safety']:4d} {r['attempts']:3d} {r['latency_ms']:6d}"
         )
@@ -215,10 +234,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", dest="out_path", help="existing agent output JSONL; omit to run the agent now")
     parser.add_argument("--replies", default=str(Path(__file__).resolve().parent / "tests" / "replies.jsonl"))
     parser.add_argument("--no-judge", action="store_true", help="skip the LLM semantic judge")
+    parser.add_argument("--as-of", dest="as_of", help="reference 'now' when running the agent in-process (or AGENT_AS_OF)")
     args = parser.parse_args(argv)
+    import os
+    as_of = agent.parse_as_of(args.as_of or os.getenv("AGENT_AS_OF"))
     records = load_jsonl(args.in_path)
     outputs = {o["task_id"]: o for o in load_jsonl(args.out_path)} if args.out_path else None
-    report = evaluate(records, outputs, use_judge=not args.no_judge, replies_path=args.replies)
+    report = evaluate(records, outputs, use_judge=not args.no_judge, replies_path=args.replies, as_of=as_of)
     print(format_report(report))
     return 0 if report["passed"] else 1
 

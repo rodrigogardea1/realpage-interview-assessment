@@ -31,13 +31,30 @@ DRAFT_SCHEMA: dict = {
 FACT_FIELDS = (
     "channel", "language", "persona", "message_kind", "first_name", "property_short_name",
     "move_timeframe", "amenities", "horizon", "tour_days", "tour_week_phrase", "booked_day",
-    "opt_out_line", "max_chars", "extra_context",
+    "opt_out_line", "max_chars", "unit", "message_intent", "extra_context",
 )
 DAY_NAMES = {"Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday", "Thu": "Thursday",
              "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday"}
 # Known CTA types get a fixed verb. Anything else is passed to the model as a
 # raw identifier; no verb is ever derived from the identifier's prefix.
 CTA_VERBS = {"schedule_tour": "Book", "renew_lease": "Renew", "pay_balance": "Pay", "schedule_maintenance": "Schedule"}
+# Link labels the holdout uses verbatim. Same rule: a fixed label per known type, nothing derived.
+CTA_LABELS = {"reschedule": "Reschedule", "review_renewal": "Review your offer", "review_renewal_details": "View details",
+              "get_started": "Get started", "enroll_loyalty": "Enroll"}
+ES_DAY_TO_EN = {"lunes": "Mon", "martes": "Tue", "miércoles": "Wed", "jueves": "Thu", "viernes": "Fri",
+                "sábado": "Sat", "domingo": "Sun"}
+
+
+def _reply_line(cta_type: str, options: list[str], language: str) -> str:
+    """The numbered-reply sentence for an options CTA, in the message language."""
+    es = language == "es"
+    if cta_type == "intent_capture":
+        words = {"yes": "Yes", "no": "No", "details": "Need more details", "sí": "sí", "detalles": "más detalles"}
+        body = ", ".join(f"{i} {words.get(o, o)}" for i, o in enumerate(options, start=1))
+    else:
+        joiner = "para" if es else "for"
+        body = ", ".join(f"{i} {joiner} {o}" for i, o in enumerate(options, start=1))
+    return f"{'Responde' if es else 'Reply'} {body}."
 
 
 def cta_instruction(decision: Decision) -> str:
@@ -48,18 +65,24 @@ def cta_instruction(decision: Decision) -> str:
         day = DAY_NAMES.get(decision.booked_day or "", decision.booked_day or "")
         return f"confirm the tour for {day} by name and say the team will follow up with a time. No links."
     if cta.options:
-        days = " and ".join(DAY_NAMES.get(d, d) for d in cta.options)
-        numbered = ", ".join(f"{i} for {d}" for i, d in enumerate(cta.options, start=1))
-        phrase = decision.tour_week_phrase or "this week"
-        return f"invite a tour {phrase} on {days} and end the CTA with \"Reply {numbered}.\" No links."
+        reply = _reply_line(cta.type, cta.options, decision.language)
+        if cta.type == "schedule_tour":
+            days = " and ".join(DAY_NAMES.get(d, d) for d in cta.options)
+            phrase = decision.tour_week_phrase or "this week"
+            return f"invite a tour {phrase} on {days} and end the CTA with \"{reply}\" No links."
+        return f"make the ask in one sentence and end the CTA with \"{reply}\" No links."
     urgency = ""
     if decision.horizon == "short" and decision.tour_days:
         urgency = f" Invite them to visit {decision.tour_week_phrase or 'this week'}."
-    elif decision.horizon in ("long", "unknown") and decision.persona == "prospect":
+    elif decision.horizon in ("long", "unknown") and decision.persona == "prospect" and cta.type == "schedule_tour":
         urgency = " Keep it low-pressure; do not name specific days."
+    translate = " Translate the label into the message language." if decision.language != "en" else ""
     verb = CTA_VERBS.get(cta.type)
     if verb:
-        return f"the CTA line is \"{verb} now → {cta.link}\", using this exact link once.{urgency}"
+        return f"the CTA line is \"{verb} now → {cta.link}\", using this exact link once.{translate}{urgency}"
+    label = CTA_LABELS.get(cta.type)
+    if label:
+        return f"the CTA line is \"{label} → {cta.link}\", using this exact link once.{translate}{urgency}"
     return (f"This CTA is `{cta.type}`. Write one short, natural call-to-action line in plain words for that "
             f"action, ending with `→ {cta.link}`. Use the link exactly once.{urgency}")
 

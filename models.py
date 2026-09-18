@@ -116,12 +116,15 @@ class Constraints(BaseModel):
     no_sensitive_discrimination: bool = True
     include_opt_out_instructions: bool = True
     primary_cta: str | None = None
+    respect_consent: bool = True          # holdout: consent-block records
+    locale_applied: bool = False          # holdout: prospect_spanish_locale
 
 
 class Assertions(BaseModel):
     model_config = ConfigDict(extra="ignore")
     required_states: list[str] = []
     constraints: Constraints = Constraints()
+    thresholds: dict[str, float] = {}     # accepted here or at the top level of the record
 
 
 class Record(BaseModel):
@@ -135,8 +138,12 @@ class Record(BaseModel):
     channel_preferences: list[str] = []
     input: RecordInput = RecordInput()
     assertions: Assertions = Assertions()
+    thresholds: dict[str, float] = {}     # every holdout record carries them at the top level
     inbound_reply: str | None = None
     last_reply: str | None = None
+
+    def effective_thresholds(self) -> dict[str, float]:
+        return {**self.assertions.thresholds, **self.thresholds}
 
     @field_validator("channel_preferences", mode="before")
     @classmethod
@@ -183,6 +190,11 @@ class Decision(BaseModel):
     booked_day: str | None = None
     opt_out_line: str = ""
     max_chars: int | None = None
+    unit: str | None = None                 # resident's own unit, regular hyphens
+    message_intent: str | None = None       # one sentence per lifecycle stage
+    anchor_source: str | None = None        # last_interaction | as_of | input.<field> | now
+    empty_message: bool = False             # no-consent lines emit the channel:"none" shape
+    post_validation_states: list[str] = ["fair_housing_check_passed", "brand_style_applied"]
     # Bounded, sanitized leftovers from the record. Copy-only: policy never reads it.
     extra_context: dict[str, str] = {}
 
@@ -205,10 +217,14 @@ class Validation(BaseModel):
 
 class NextMessage(BaseModel):
     channel: str
-    send_at: str
+    send_at: str | None
     subject: str | None
-    body: str
-    cta: dict[str, Any]
+    body: str | None
+    cta: dict[str, Any] | None
+
+
+# holdout resident_opt_out_respected: the no-consent line is this exact shape, not null.
+EMPTY_MESSAGE: dict[str, Any] = {"channel": "none", "send_at": None, "subject": None, "body": None, "cta": None}
 
 
 class OutputLine(BaseModel):
